@@ -1,18 +1,3 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson and Diego Moreda.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Aid in submitting information to MusicBrainz.
 
 This plugin allows the user to print track information in a format that is
@@ -22,39 +7,100 @@ implemented by MusicBrainz yet.
 [1] https://wiki.musicbrainz.org/History:How_To_Parse_Track_Listings
 """
 
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
 
+import subprocess
+from functools import cached_property
+from typing import TYPE_CHECKING
 
+from beets import ui
 from beets.autotag import Recommendation
 from beets.plugins import BeetsPlugin
-from beets.ui.commands import PromptChoice
-from beetsplug.info import print_data
+from beets.util import PromptChoice, displayable_path
+
+if TYPE_CHECKING:
+    import optparse
+    from collections.abc import Sequence
+
+    from beets.importer import ImportSession, ImportTask
+    from beets.library import Item, Library
 
 
 class MBSubmitPlugin(BeetsPlugin):
-    def __init__(self):
-        super(MBSubmitPlugin, self).__init__()
+    def __init__(self) -> None:
+        super().__init__()
 
-        self.config.add({
-            'format': u'$track. $title - $artist ($length)',
-            'threshold': 'medium',
-        })
+        self.config.add(
+            {
+                "format": "$track. $title - $artist ($length)",
+                "threshold": "medium",
+                "picard_path": "picard",
+            }
+        )
 
         # Validate and store threshold.
-        self.threshold = self.config['threshold'].as_choice({
-            'none': Recommendation.none,
-            'low': Recommendation.low,
-            'medium': Recommendation.medium,
-            'strong': Recommendation.strong
-        })
+        self.threshold = self.config["threshold"].as_choice(
+            {
+                "none": Recommendation.none,
+                "low": Recommendation.low,
+                "medium": Recommendation.medium,
+                "strong": Recommendation.strong,
+            }
+        )
 
-        self.register_listener('before_choose_candidate',
-                               self.before_choose_candidate_event)
+        self.register_listener(
+            "before_choose_candidate", self.before_choose_candidate_event
+        )
 
-    def before_choose_candidate_event(self, session, task):
-        if task.rec <= self.threshold:
-            return [PromptChoice(u'p', u'Print tracks', self.print_tracks)]
+    def before_choose_candidate_event(
+        self, session: ImportSession, task: ImportTask
+    ) -> list[PromptChoice]:
+        if task.rec is not None and task.rec <= self.threshold:
+            return [
+                PromptChoice("p", "Print tracks", self.print_tracks),
+                PromptChoice("o", "Open files with Picard", self.picard),
+            ]
+        return []
 
-    def print_tracks(self, session, task):
-        for i in sorted(task.items, key=lambda i: i.track):
-            print_data(None, i, self.config['format'].as_str())
+    def picard(self, session: ImportSession, task: ImportTask) -> None:
+        paths = []
+        for p in task.paths:
+            paths.append(displayable_path(p))
+        try:
+            picard_path = self.config["picard_path"].as_str()
+            subprocess.Popen([picard_path, *paths])
+            self._log.info("launched picard from\n{}", picard_path)
+        except OSError as exc:
+            self._log.error("Could not open picard, got error:\n{}", exc)
+
+    @cached_property
+    def fmt(self) -> str:
+        return self.config["format"].as_str()
+
+    @staticmethod
+    def _item_sort_key(item: Item) -> tuple[int, int]:
+        return (item.disc or 0, item.track or 0)
+
+    def print_tracks(self, session: ImportSession, task: ImportTask) -> None:
+        for i in sorted(task.items, key=self._item_sort_key):
+            ui.print_(format(i, self.fmt))
+
+    def commands(self) -> list[ui.Subcommand]:
+        """Add beet UI commands for mbsubmit."""
+        mbsubmit_cmd = ui.Subcommand(
+            "mbsubmit", help="Submit Tracks to MusicBrainz"
+        )
+
+        def func(lib: Library, opts: optparse.Values, args: list[str]) -> None:
+            items = lib.items(args, limit=opts.limit)
+            self._mbsubmit(items)
+
+        mbsubmit_cmd.parser.add_limit_option()
+        mbsubmit_cmd.func = func
+
+        return [mbsubmit_cmd]
+
+    def _mbsubmit(self, items: Sequence[Item]) -> None:
+        """Print track information to be submitted to MusicBrainz."""
+        for i in sorted(items, key=self._item_sort_key):
+            ui.print_(format(i, self.fmt))

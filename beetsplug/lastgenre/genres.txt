@@ -1,5 +1,5 @@
 2 tone
-2-step garage
+2-step
 4-beat
 4x4 garage
 8-bit
@@ -12,10 +12,12 @@ acid rock
 acoustic music
 acousticana
 adult contemporary music
+african
 african popular music
 african rumba
 afrobeat
 aleatoric music
+alternative
 alternative country
 alternative dance
 alternative hip hop
@@ -112,7 +114,7 @@ blue-eyed soul
 bluegrass
 blues
 blues ballad
-blues-rock
+blues rock
 boogie
 boogie woogie
 boogie-woogie
@@ -123,6 +125,7 @@ brazilian jazz
 breakbeat
 breakbeat hardcore
 breakcore
+breaks
 breton music
 brill building pop
 britfunk
@@ -160,10 +163,14 @@ calypso jazz
 calypso-style baila
 campursari
 canatronic
+canción de autor
 candombe
 canon
 canrock
 cantata
+cantautorato
+cantautor
+cantautora
 cante chico
 cante jondo
 canterbury scene
@@ -223,6 +230,7 @@ chicano rap
 chicha
 chicken scratch
 children's music
+chill
 chillout
 chillwave
 chimurenga
@@ -230,6 +238,7 @@ chinese music
 chinese pop
 chinese rock
 chip music
+chiptune
 cho-kantrum
 chongak
 chopera
@@ -332,7 +341,6 @@ dabka
 dadra
 daina
 dalauna
-dance
 dance music
 dance-pop
 dance-punk
@@ -345,10 +353,10 @@ danza
 danzón
 dark ambient
 dark cabaret
+dark wave
 dark pop
 darkcore
 darkstep
-darkwave
 de ascultat la servici
 de codru
 de dragoste
@@ -371,6 +379,7 @@ desert rock
 desi
 detroit blues
 detroit techno
+dub techno
 dhamar
 dhimotiká
 dhrupad
@@ -390,7 +399,6 @@ disney pop
 diva house
 divine rock
 dixieland
-dixieland jazz
 djambadon
 djent
 dodompa
@@ -410,6 +418,7 @@ drone metal
 drone music
 dronology
 drum and bass
+drumfunk
 dub
 dub house
 dubanguthu
@@ -492,6 +501,7 @@ folk pop
 folk punk
 folk rock
 folktronica
+footwork
 forró
 franco-country
 freak-folk
@@ -513,6 +523,7 @@ full on
 funaná
 funeral doom
 funk
+funk / soul
 funk metal
 funk rock
 funkcore
@@ -674,6 +685,7 @@ impressionist music
 improvisational
 incidental music
 indian pop
+indie
 indie folk
 indie music
 indie pop
@@ -683,12 +695,13 @@ indo jazz
 indo rock
 indonesian pop
 indoyíftika
+industrial
 industrial death metal
-industrial hip-hop
+industrial hip hop
 industrial metal
-industrial music
 industrial musical
 industrial rock
+industrial techno
 instrumental rock
 intelligent dance music
 international latin
@@ -750,6 +763,8 @@ jtek
 jug band
 jujitsu
 juju
+juke
+juke/footwork
 juke joint blues
 jump blues
 jumpstyle
@@ -963,6 +978,7 @@ min'yo
 mineras
 mini compas
 mini-jazz
+minimal
 minimal techno
 minimalist music
 minimalist trance
@@ -1058,7 +1074,7 @@ nintendocore
 nisiótika
 no wave
 noh
-noise music
+noise
 noise pop
 noise rock
 nongak
@@ -1069,16 +1085,20 @@ nortec
 norteño
 northern soul
 nota
-nu breaks
+nu disco
 nu jazz
 nu metal
 nu soul
+nu skool breaks
 nueva canción
 nyatiti
 néo kýma
 obscuro
 oi!
+old school death metal
+old school hardcore
 old school hip hop
+old school jungle
 old-time
 oldies
 olonkho
@@ -1185,11 +1205,13 @@ progressive trance
 progressive thrash metal
 protopunk
 psych folk
+psychedelic folk
 psychedelic music
 psychedelic pop
 psychedelic rock
-psychedelic trance
+psychedelic soul
 psychobilly
+psytrance
 punk blues
 punk cabaret
 punk jazz
@@ -1244,8 +1266,7 @@ renaissance music
 requiem
 rhapsody
 rhyming spiritual
-rhythm & blues
-rhythm and blues
+r&b
 ricercar
 riot grrrl
 rock
@@ -1309,6 +1330,7 @@ shabad
 shalako
 shan'ge
 shango
+shangaan electro
 shape note
 shibuya-kei
 shidaiqu
@@ -1323,8 +1345,10 @@ sica
 siguiriyas
 silat
 sinawi
+singer-songwriter
 situational
 ska
+ska jazz
 ska punk
 skacore
 skald
@@ -1401,9 +1425,11 @@ symphonic metal
 symphonic poem
 symphonic rock
 symphony
+synth-pop
+synth funk
 synthcore
-synthpop
 synthpunk
+synthwave
 t'ong guitar
 taarab
 tai tu
@@ -1449,6 +1475,7 @@ tinga
 tinku
 toeshey
 togaku
+trad
 trad jazz
 traditional bluegrass
 traditional heavy metal
@@ -1459,7 +1486,6 @@ tribal house
 trikitixa
 trip hop
 trip rock
-trip-hop
 tropicalia
 tropicalismo
 tropipop

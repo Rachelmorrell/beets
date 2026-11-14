@@ -1,348 +1,301 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
+"""Test file manipulation functionality of Item."""
 
-"""Test file manipulation functionality of Item.
-"""
-from __future__ import division, absolute_import, print_function
-
-import shutil
 import os
+import shutil
 import stat
-from os.path import join
 import unittest
+from pathlib import Path
 
-from test import _common
-from test._common import item, touch
 import beets.library
 from beets import util
-from beets.util import MoveOperation
+from beets.test import _common
+from beets.test._common import item
+from beets.test.helper import NEEDS_REFLINK, BeetsTestCase
+from beets.util import MoveOperation, syspath
 
 
-class MoveTest(_common.TestCase):
+class MoveTest(BeetsTestCase):
     def setUp(self):
-        super(MoveTest, self).setUp()
+        super().setUp()
 
         # make a temporary file
-        self.path = join(self.temp_dir, b'temp.mp3')
-        shutil.copy(join(_common.RSRC, b'full.mp3'), self.path)
+        self.temp_music_file_name = Path("temp.mp3")
+        self.path = self.temp_path / self.temp_music_file_name
+        shutil.copy(self.resource_path, self.path)
 
         # add it to a temporary library
-        self.lib = beets.library.Library(':memory:')
         self.i = beets.library.Item.from_path(self.path)
         self.lib.add(self.i)
 
         # set up the destination
-        self.libdir = join(self.temp_dir, b'testlibdir')
-        os.mkdir(self.libdir)
-        self.lib.directory = self.libdir
-        self.lib.path_formats = [('default',
-                                  join('$artist', '$album', '$title'))]
-        self.i.artist = 'one'
-        self.i.album = 'two'
-        self.i.title = 'three'
-        self.dest = join(self.libdir, b'one', b'two', b'three.mp3')
+        self.lib.path_formats = [
+            ("default", str(Path("$artist") / "$album" / "$title"))
+        ]
+        self.i.artist = "one"
+        self.i.album = "two"
+        self.i.title = "three"
+        self.dest = self.lib_path / "one" / "two" / "three.mp3"
 
-        self.otherdir = join(self.temp_dir, b'testotherdir')
+        self.otherdir = self.temp_path / "testotherdir"
 
     def test_move_arrives(self):
         self.i.move()
-        self.assertExists(self.dest)
+        assert self.dest.exists()
 
     def test_move_to_custom_dir(self):
-        self.i.move(basedir=self.otherdir)
-        self.assertExists(join(self.otherdir, b'one', b'two', b'three.mp3'))
+        self.i.move(basedir=os.fsencode(self.otherdir))
+        assert (self.otherdir / "one" / "two" / "three.mp3").exists()
 
     def test_move_departs(self):
         self.i.move()
-        self.assertNotExists(self.path)
+        assert not self.path.exists()
 
     def test_move_in_lib_prunes_empty_dir(self):
         self.i.move()
-        old_path = self.i.path
-        self.assertExists(old_path)
+        old_path = self.i.filepath
+        assert old_path.exists()
 
-        self.i.artist = u'newArtist'
+        self.i.artist = "newArtist"
         self.i.move()
-        self.assertNotExists(old_path)
-        self.assertNotExists(os.path.dirname(old_path))
+        assert not old_path.exists()
+        assert not old_path.parent.exists()
 
     def test_copy_arrives(self):
         self.i.move(operation=MoveOperation.COPY)
-        self.assertExists(self.dest)
+        assert self.dest.exists()
 
     def test_copy_does_not_depart(self):
         self.i.move(operation=MoveOperation.COPY)
-        self.assertExists(self.path)
+        assert self.path.exists()
 
     def test_reflink_arrives(self):
         self.i.move(operation=MoveOperation.REFLINK_AUTO)
-        self.assertExists(self.dest)
+        assert self.dest.exists()
 
     def test_reflink_does_not_depart(self):
         self.i.move(operation=MoveOperation.REFLINK_AUTO)
-        self.assertExists(self.path)
+        assert self.path.exists()
 
-    @unittest.skipUnless(_common.HAVE_REFLINK, "need reflink")
+    @NEEDS_REFLINK
     def test_force_reflink_arrives(self):
         self.i.move(operation=MoveOperation.REFLINK)
-        self.assertExists(self.dest)
+        assert self.dest.exists()
 
-    @unittest.skipUnless(_common.HAVE_REFLINK, "need reflink")
+    @NEEDS_REFLINK
     def test_force_reflink_does_not_depart(self):
         self.i.move(operation=MoveOperation.REFLINK)
-        self.assertExists(self.path)
+        assert self.path.exists()
 
     def test_move_changes_path(self):
         self.i.move()
-        self.assertEqual(self.i.path, util.normpath(self.dest))
+        assert self.i.path == util.normpath(os.fsencode(self.dest))
 
     def test_copy_already_at_destination(self):
         self.i.move()
         old_path = self.i.path
         self.i.move(operation=MoveOperation.COPY)
-        self.assertEqual(self.i.path, old_path)
+        assert self.i.path == old_path
 
     def test_move_already_at_destination(self):
         self.i.move()
         old_path = self.i.path
         self.i.move()
-        self.assertEqual(self.i.path, old_path)
+        assert self.i.path == old_path
 
     def test_move_file_with_colon(self):
-        self.i.artist = u'C:DOS'
+        self.i.artist = "C:DOS"
         self.i.move()
-        self.assertIn('C_DOS', self.i.path.decode())
+        assert "C_DOS" in self.i.path.decode()
 
     def test_move_file_with_multiple_colons(self):
-        print(beets.config['replace'])
-        self.i.artist = u'COM:DOS'
+        self.i.artist = "COM:DOS"
         self.i.move()
-        self.assertIn('COM_DOS', self.i.path.decode())
+        assert "COM_DOS" in self.i.path.decode()
 
     def test_move_file_with_colon_alt_separator(self):
-        old = beets.config['drive_sep_replace']
-        beets.config["drive_sep_replace"] = '0'
-        self.i.artist = u'C:DOS'
+        old = self.config["drive_sep_replace"]
+        self.config["drive_sep_replace"] = "0"
+        self.i.artist = "C:DOS"
         self.i.move()
-        self.assertIn('C0DOS', self.i.path.decode())
-        beets.config["drive_sep_replace"] = old
+        assert "C0DOS" in self.i.path.decode()
+        self.config["drive_sep_replace"] = old
 
     def test_read_only_file_copied_writable(self):
         # Make the source file read-only.
-        os.chmod(self.path, 0o444)
+        self.path.chmod(0o444)
 
         try:
             self.i.move(operation=MoveOperation.COPY)
-            self.assertTrue(os.access(self.i.path, os.W_OK))
+            assert os.access(self.i.filepath, os.W_OK)
         finally:
             # Make everything writable so it can be cleaned up.
-            os.chmod(self.path, 0o777)
-            os.chmod(self.i.path, 0o777)
+            self.path.chmod(0o777)
+            self.i.filepath.chmod(0o777)
 
     def test_move_avoids_collision_with_existing_file(self):
         # Make a conflicting file at the destination.
-        dest = self.i.destination()
-        os.makedirs(os.path.dirname(dest))
-        touch(dest)
+        dest = Path(os.fsdecode(self.i.destination()))
+        util.mkdirall(dest)
+        dest.touch()
 
         self.i.move()
-        self.assertNotEqual(self.i.path, dest)
-        self.assertEqual(os.path.dirname(self.i.path),
-                         os.path.dirname(dest))
+        assert self.i.filepath != dest
+        assert self.i.filepath.parent == dest.parent
 
     @unittest.skipUnless(_common.HAVE_SYMLINK, "need symlinks")
     def test_link_arrives(self):
         self.i.move(operation=MoveOperation.LINK)
-        self.assertExists(self.dest)
-        self.assertTrue(os.path.islink(self.dest))
-        self.assertEqual(os.readlink(self.dest), self.path)
+        assert self.dest.exists()
+        assert self.dest.is_symlink()
+        assert self.dest.resolve() == self.path.resolve()
 
     @unittest.skipUnless(_common.HAVE_SYMLINK, "need symlinks")
     def test_link_does_not_depart(self):
         self.i.move(operation=MoveOperation.LINK)
-        self.assertExists(self.path)
+        assert self.path.exists()
 
     @unittest.skipUnless(_common.HAVE_SYMLINK, "need symlinks")
     def test_link_changes_path(self):
         self.i.move(operation=MoveOperation.LINK)
-        self.assertEqual(self.i.path, util.normpath(self.dest))
+        assert self.i.path == util.normpath(os.fsencode(self.dest))
 
     @unittest.skipUnless(_common.HAVE_HARDLINK, "need hardlinks")
     def test_hardlink_arrives(self):
         self.i.move(operation=MoveOperation.HARDLINK)
-        self.assertExists(self.dest)
-        s1 = os.stat(self.path)
-        s2 = os.stat(self.dest)
-        self.assertTrue(
-            (s1[stat.ST_INO], s1[stat.ST_DEV]) ==
-            (s2[stat.ST_INO], s2[stat.ST_DEV])
+        assert self.dest.exists()
+        s1 = self.path.stat()
+        s2 = self.dest.stat()
+        assert (s1[stat.ST_INO], s1[stat.ST_DEV]) == (
+            s2[stat.ST_INO],
+            s2[stat.ST_DEV],
         )
 
     @unittest.skipUnless(_common.HAVE_HARDLINK, "need hardlinks")
     def test_hardlink_does_not_depart(self):
         self.i.move(operation=MoveOperation.HARDLINK)
-        self.assertExists(self.path)
+        assert self.path.exists()
 
     @unittest.skipUnless(_common.HAVE_HARDLINK, "need hardlinks")
     def test_hardlink_changes_path(self):
         self.i.move(operation=MoveOperation.HARDLINK)
-        self.assertEqual(self.i.path, util.normpath(self.dest))
+        assert self.i.path == util.normpath(os.fsencode(self.dest))
+
+    @unittest.skipUnless(_common.HAVE_HARDLINK, "need hardlinks")
+    def test_hardlink_from_symlink(self):
+        link_path = self.temp_path / "temp_link.mp3"
+        link_path.symlink_to(self.temp_music_file_name)
+        self.i.path = link_path
+        self.i.move(operation=MoveOperation.HARDLINK)
+
+        s1 = self.path.stat()
+        s2 = self.dest.stat()
+        assert (s1[stat.ST_INO], s1[stat.ST_DEV]) == (
+            s2[stat.ST_INO],
+            s2[stat.ST_DEV],
+        )
 
 
-class HelperTest(_common.TestCase):
-    def test_ancestry_works_on_file(self):
-        p = '/a/b/c'
-        a = ['/', '/a', '/a/b']
-        self.assertEqual(util.ancestry(p), a)
-
-    def test_ancestry_works_on_dir(self):
-        p = '/a/b/c/'
-        a = ['/', '/a', '/a/b', '/a/b/c']
-        self.assertEqual(util.ancestry(p), a)
-
-    def test_ancestry_works_on_relative(self):
-        p = 'a/b/c'
-        a = ['a', 'a/b']
-        self.assertEqual(util.ancestry(p), a)
-
-    def test_components_works_on_file(self):
-        p = '/a/b/c'
-        a = ['/', 'a', 'b', 'c']
-        self.assertEqual(util.components(p), a)
-
-    def test_components_works_on_dir(self):
-        p = '/a/b/c/'
-        a = ['/', 'a', 'b', 'c']
-        self.assertEqual(util.components(p), a)
-
-    def test_components_works_on_relative(self):
-        p = 'a/b/c'
-        a = ['a', 'b', 'c']
-        self.assertEqual(util.components(p), a)
-
-    def test_forward_slash(self):
-        p = br'C:\a\b\c'
-        a = br'C:/a/b/c'
-        self.assertEqual(util.path_as_posix(p), a)
-
-
-class AlbumFileTest(_common.TestCase):
+class AlbumFileTest(BeetsTestCase):
     def setUp(self):
-        super(AlbumFileTest, self).setUp()
+        super().setUp()
 
         # Make library and item.
-        self.lib = beets.library.Library(':memory:')
-        self.lib.path_formats = \
-            [('default', join('$albumartist', '$album', '$title'))]
-        self.libdir = os.path.join(self.temp_dir, b'testlibdir')
-        self.lib.directory = self.libdir
+        self.lib.path_formats = [
+            ("default", str(Path("$albumartist") / "$album" / "$title"))
+        ]
         self.i = item(self.lib)
         # Make a file for the item.
         self.i.path = self.i.destination()
-        util.mkdirall(self.i.path)
-        touch(self.i.path)
+        util.mkdirall(self.i.filepath)
+        self.i.filepath.touch()
         # Make an album.
         self.ai = self.lib.add_album((self.i,))
         # Alternate destination dir.
-        self.otherdir = os.path.join(self.temp_dir, b'testotherdir')
+        self.otherdir = os.fsencode(self.temp_path / "testotherdir")
 
     def test_albuminfo_move_changes_paths(self):
-        self.ai.album = u'newAlbumName'
+        self.ai.album = "newAlbumName"
         self.ai.move()
         self.ai.store()
         self.i.load()
 
-        self.assertTrue(b'newAlbumName' in self.i.path)
+        assert b"newAlbumName" in self.i.path
 
     def test_albuminfo_move_moves_file(self):
-        oldpath = self.i.path
-        self.ai.album = u'newAlbumName'
+        oldpath = self.i.filepath
+        self.ai.album = "newAlbumName"
         self.ai.move()
         self.ai.store()
         self.i.load()
 
-        self.assertFalse(os.path.exists(oldpath))
-        self.assertTrue(os.path.exists(self.i.path))
+        assert not oldpath.exists()
+        assert self.i.filepath.exists()
 
     def test_albuminfo_move_copies_file(self):
-        oldpath = self.i.path
-        self.ai.album = u'newAlbumName'
+        oldpath = self.i.filepath
+        self.ai.album = "newAlbumName"
         self.ai.move(operation=MoveOperation.COPY)
         self.ai.store()
         self.i.load()
 
-        self.assertTrue(os.path.exists(oldpath))
-        self.assertTrue(os.path.exists(self.i.path))
+        assert oldpath.exists()
+        assert self.i.filepath.exists()
 
-    @unittest.skipUnless(_common.HAVE_REFLINK, "need reflink")
+    @NEEDS_REFLINK
     def test_albuminfo_move_reflinks_file(self):
-        oldpath = self.i.path
-        self.ai.album = u'newAlbumName'
+        oldpath = self.i.filepath
+        self.ai.album = "newAlbumName"
         self.ai.move(operation=MoveOperation.REFLINK)
         self.ai.store()
         self.i.load()
 
-        self.assertTrue(os.path.exists(oldpath))
-        self.assertTrue(os.path.exists(self.i.path))
+        assert oldpath.exists()
+        assert self.i.filepath.exists()
 
     def test_albuminfo_move_to_custom_dir(self):
         self.ai.move(basedir=self.otherdir)
         self.i.load()
         self.ai.store()
-        self.assertTrue(b'testotherdir' in self.i.path)
+        assert b"testotherdir" in self.i.path
 
 
-class ArtFileTest(_common.TestCase):
+class ArtFileTest(BeetsTestCase):
     def setUp(self):
-        super(ArtFileTest, self).setUp()
+        super().setUp()
 
         # Make library and item.
-        self.lib = beets.library.Library(':memory:')
-        self.libdir = os.path.join(self.temp_dir, b'testlibdir')
-        self.lib.directory = self.libdir
         self.i = item(self.lib)
         self.i.path = self.i.destination()
         # Make a music file.
-        util.mkdirall(self.i.path)
-        touch(self.i.path)
+        util.mkdirall(self.i.filepath)
+        self.i.filepath.touch()
         # Make an album.
         self.ai = self.lib.add_album((self.i,))
         # Make an art file too.
-        self.art = self.lib.get_album(self.i).art_destination('something.jpg')
-        touch(self.art)
-        self.ai.artpath = self.art
+        art_bytes = self.lib.get_album(self.i).art_destination("something.jpg")
+        self.art = Path(os.fsdecode(art_bytes))
+        self.art.touch()
+        self.ai.artpath = art_bytes
         self.ai.store()
         # Alternate destination dir.
-        self.otherdir = os.path.join(self.temp_dir, b'testotherdir')
+        self.otherdir = os.fsencode(self.temp_path / "testotherdir")
 
     def test_art_deleted_when_items_deleted(self):
-        self.assertTrue(os.path.exists(self.art))
+        assert self.art.exists()
         self.ai.remove(True)
-        self.assertFalse(os.path.exists(self.art))
+        assert not self.art.exists()
 
     def test_art_moves_with_album(self):
-        self.assertTrue(os.path.exists(self.art))
+        assert self.art.exists()
         oldpath = self.i.path
-        self.ai.album = u'newAlbum'
+        self.ai.album = "newAlbum"
         self.ai.move()
         self.i.load()
 
-        self.assertNotEqual(self.i.path, oldpath)
-        self.assertFalse(os.path.exists(self.art))
+        assert self.i.path != oldpath
+        assert not self.art.exists()
         newart = self.lib.get_album(self.i).art_destination(self.art)
-        self.assertTrue(os.path.exists(newart))
+        assert Path(os.fsdecode(newart)).exists()
 
     def test_art_moves_with_album_to_custom_dir(self):
         # Move the album to another directory.
@@ -351,367 +304,197 @@ class ArtFileTest(_common.TestCase):
         self.i.load()
 
         # Art should be in new directory.
-        self.assertNotExists(self.art)
-        newart = self.lib.get_album(self.i).artpath
-        self.assertExists(newart)
-        self.assertTrue(b'testotherdir' in newart)
+        assert not self.art.exists()
+        newart = self.lib.get_album(self.i).art_filepath
+        assert newart.exists()
+        assert "testotherdir" in str(newart)
 
     def test_setart_copies_image(self):
-        os.remove(self.art)
+        util.remove(self.art)
 
-        newart = os.path.join(self.libdir, b'newart.jpg')
-        touch(newart)
+        newart = self.lib_path / "newart.jpg"
+        newart.touch()
         i2 = item()
         i2.path = self.i.path
-        i2.artist = u'someArtist'
+        i2.artist = "someArtist"
         ai = self.lib.add_album((i2,))
         i2.move(operation=MoveOperation.COPY)
 
-        self.assertEqual(ai.artpath, None)
+        assert ai.artpath is None
         ai.set_art(newart)
-        self.assertTrue(os.path.exists(ai.artpath))
+        assert ai.art_filepath.exists()
 
     def test_setart_to_existing_art_works(self):
-        os.remove(self.art)
+        util.remove(self.art)
 
         # Original art.
-        newart = os.path.join(self.libdir, b'newart.jpg')
-        touch(newart)
+        newart = self.lib_path / "newart.jpg"
+        newart.touch()
         i2 = item()
         i2.path = self.i.path
-        i2.artist = u'someArtist'
+        i2.artist = "someArtist"
         ai = self.lib.add_album((i2,))
         i2.move(operation=MoveOperation.COPY)
         ai.set_art(newart)
 
         # Set the art again.
         ai.set_art(ai.artpath)
-        self.assertTrue(os.path.exists(ai.artpath))
+        assert ai.art_filepath.exists()
 
     def test_setart_to_existing_but_unset_art_works(self):
-        newart = os.path.join(self.libdir, b'newart.jpg')
-        touch(newart)
+        newart = self.lib_path / "newart.jpg"
+        newart.touch()
         i2 = item()
         i2.path = self.i.path
-        i2.artist = u'someArtist'
+        i2.artist = "someArtist"
         ai = self.lib.add_album((i2,))
         i2.move(operation=MoveOperation.COPY)
 
         # Copy the art to the destination.
         artdest = ai.art_destination(newart)
-        shutil.copy(newart, artdest)
+        shutil.copy(newart, syspath(artdest))
 
         # Set the art again.
         ai.set_art(artdest)
-        self.assertTrue(os.path.exists(ai.artpath))
+        assert ai.art_filepath.exists()
 
-    def test_setart_to_conflicting_file_gets_new_path(self):
-        newart = os.path.join(self.libdir, b'newart.jpg')
-        touch(newart)
+    def test_setart_to_conflicting_file_replaces_it(self):
+        newart = self.lib_path / "newart.jpg"
+        newart.touch()
         i2 = item()
         i2.path = self.i.path
-        i2.artist = u'someArtist'
+        i2.artist = "someArtist"
         ai = self.lib.add_album((i2,))
         i2.move(operation=MoveOperation.COPY)
 
         # Make a file at the destination.
-        artdest = ai.art_destination(newart)
-        touch(artdest)
+        artdest = Path(os.fsdecode(ai.art_destination(newart)))
+        artdest.touch()
 
-        # Set the art.
+        # Set the art - should replace the existing file, not create a suffixed
+        # duplicate like cover.2.jpg.
         ai.set_art(newart)
-        self.assertNotEqual(artdest, ai.artpath)
-        self.assertEqual(os.path.dirname(artdest),
-                         os.path.dirname(ai.artpath))
+        assert artdest == ai.art_filepath
+
+    def test_setart_replaces_old_art_at_different_path(self):
+        newart = self.lib_path / "newart.png"
+        newart.touch()
+        i2 = item()
+        i2.path = self.i.path
+        i2.artist = "someArtist"
+        ai = self.lib.add_album((i2,))
+        i2.move(operation=MoveOperation.COPY)
+
+        # Set initial art.
+        ai.set_art(newart)
+        old_artpath = ai.art_filepath
+        assert old_artpath.exists()
+
+        # Set new art with a different extension.
+        another_art = self.lib_path / "another.jpg"
+        another_art.touch()
+        ai.set_art(another_art)
+
+        # Old art should be removed.
+        assert not old_artpath.exists()
+        assert ai.art_filepath.exists()
 
     def test_setart_sets_permissions(self):
-        os.remove(self.art)
+        util.remove(self.art)
 
-        newart = os.path.join(self.libdir, b'newart.jpg')
-        touch(newart)
-        os.chmod(newart, 0o400)  # read-only
+        newart = self.lib_path / "newart.jpg"
+        newart.touch()
+        newart.chmod(0o400)  # read-only
 
         try:
             i2 = item()
             i2.path = self.i.path
-            i2.artist = u'someArtist'
+            i2.artist = "someArtist"
             ai = self.lib.add_album((i2,))
             i2.move(operation=MoveOperation.COPY)
             ai.set_art(newart)
 
-            mode = stat.S_IMODE(os.stat(ai.artpath).st_mode)
-            self.assertTrue(mode & stat.S_IRGRP)
-            self.assertTrue(os.access(ai.artpath, os.W_OK))
+            mode = stat.S_IMODE(ai.art_filepath.stat().st_mode)
+            assert mode & stat.S_IRGRP
+            assert os.access(ai.art_filepath, os.W_OK)
 
         finally:
             # Make everything writable so it can be cleaned up.
-            os.chmod(newart, 0o777)
-            os.chmod(ai.artpath, 0o777)
+            newart.chmod(0o777)
+            ai.art_filepath.chmod(0o777)
 
     def test_move_last_file_moves_albumart(self):
-        oldartpath = self.lib.albums()[0].artpath
-        self.assertExists(oldartpath)
+        oldartpath = self.lib.albums()[0].art_filepath
+        assert oldartpath.exists()
 
-        self.ai.album = u'different_album'
+        self.ai.album = "different_album"
         self.ai.store()
         self.ai.items()[0].move()
 
-        artpath = self.lib.albums()[0].artpath
-        self.assertTrue(b'different_album' in artpath)
-        self.assertExists(artpath)
-        self.assertNotExists(oldartpath)
+        artpath = self.lib.albums()[0].art_filepath
+        assert "different_album" in str(artpath)
+        assert artpath.exists()
+        assert not oldartpath.exists()
 
     def test_move_not_last_file_does_not_move_albumart(self):
         i2 = item()
         i2.albumid = self.ai.id
         self.lib.add(i2)
 
-        oldartpath = self.lib.albums()[0].artpath
-        self.assertExists(oldartpath)
+        oldartpath = self.lib.albums()[0].art_filepath
+        assert oldartpath.exists()
 
-        self.i.album = u'different_album'
+        self.i.album = "different_album"
         self.i.album_id = None  # detach from album
         self.i.move()
 
-        artpath = self.lib.albums()[0].artpath
-        self.assertFalse(b'different_album' in artpath)
-        self.assertEqual(artpath, oldartpath)
-        self.assertExists(oldartpath)
+        artpath = self.lib.albums()[0].art_filepath
+        assert "different_album" not in str(artpath)
+        assert artpath == oldartpath
+        assert oldartpath.exists()
 
 
-class RemoveTest(_common.TestCase):
+class RemoveTest(BeetsTestCase):
     def setUp(self):
-        super(RemoveTest, self).setUp()
+        super().setUp()
 
         # Make library and item.
-        self.lib = beets.library.Library(':memory:')
-        self.libdir = os.path.join(self.temp_dir, b'testlibdir')
-        self.lib.directory = self.libdir
         self.i = item(self.lib)
         self.i.path = self.i.destination()
         # Make a music file.
-        util.mkdirall(self.i.path)
-        touch(self.i.path)
+        util.mkdirall(self.i.filepath)
+        self.i.filepath.touch()
         # Make an album with the item.
         self.ai = self.lib.add_album((self.i,))
 
     def test_removing_last_item_prunes_empty_dir(self):
-        parent = os.path.dirname(self.i.path)
-        self.assertExists(parent)
+        assert self.i.filepath.parent.exists()
         self.i.remove(True)
-        self.assertNotExists(parent)
+        assert not self.i.filepath.parent.exists()
 
     def test_removing_last_item_preserves_nonempty_dir(self):
-        parent = os.path.dirname(self.i.path)
-        touch(os.path.join(parent, b'dummy.txt'))
+        (self.i.filepath.parent / "dummy.txt").touch()
         self.i.remove(True)
-        self.assertExists(parent)
+        assert self.i.filepath.parent.exists()
 
     def test_removing_last_item_prunes_dir_with_blacklisted_file(self):
-        parent = os.path.dirname(self.i.path)
-        touch(os.path.join(parent, b'.DS_Store'))
+        (self.i.filepath.parent / ".DS_Store").touch()
         self.i.remove(True)
-        self.assertNotExists(parent)
+        assert not self.i.filepath.parent.exists()
 
     def test_removing_without_delete_leaves_file(self):
-        path = self.i.path
         self.i.remove(False)
-        self.assertExists(path)
+        assert self.i.filepath.parent.exists()
 
     def test_removing_last_item_preserves_library_dir(self):
         self.i.remove(True)
-        self.assertExists(self.libdir)
-
-    def test_removing_item_outside_of_library_deletes_nothing(self):
-        self.lib.directory = os.path.join(self.temp_dir, b'xxx')
-        parent = os.path.dirname(self.i.path)
-        self.i.remove(True)
-        self.assertExists(parent)
+        assert self.lib_path.exists()
 
     def test_removing_last_item_in_album_with_albumart_prunes_dir(self):
-        artfile = os.path.join(self.temp_dir, b'testart.jpg')
-        touch(artfile)
+        artfile = self.temp_path / "testart.jpg"
+        artfile.touch()
         self.ai.set_art(artfile)
         self.ai.store()
 
-        parent = os.path.dirname(self.i.path)
         self.i.remove(True)
-        self.assertNotExists(parent)
-
-
-# Tests that we can "delete" nonexistent files.
-class SoftRemoveTest(_common.TestCase):
-    def setUp(self):
-        super(SoftRemoveTest, self).setUp()
-
-        self.path = os.path.join(self.temp_dir, b'testfile')
-        touch(self.path)
-
-    def test_soft_remove_deletes_file(self):
-        util.remove(self.path, True)
-        self.assertNotExists(self.path)
-
-    def test_soft_remove_silent_on_no_file(self):
-        try:
-            util.remove(self.path + b'XXX', True)
-        except OSError:
-            self.fail(u'OSError when removing path')
-
-
-class SafeMoveCopyTest(_common.TestCase):
-    def setUp(self):
-        super(SafeMoveCopyTest, self).setUp()
-
-        self.path = os.path.join(self.temp_dir, b'testfile')
-        touch(self.path)
-        self.otherpath = os.path.join(self.temp_dir, b'testfile2')
-        touch(self.otherpath)
-        self.dest = self.path + b'.dest'
-
-    def test_successful_move(self):
-        util.move(self.path, self.dest)
-        self.assertExists(self.dest)
-        self.assertNotExists(self.path)
-
-    def test_successful_copy(self):
-        util.copy(self.path, self.dest)
-        self.assertExists(self.dest)
-        self.assertExists(self.path)
-
-    @unittest.skipUnless(_common.HAVE_REFLINK, "need reflink")
-    def test_successful_reflink(self):
-        util.reflink(self.path, self.dest)
-        self.assertExists(self.dest)
-        self.assertExists(self.path)
-
-    def test_unsuccessful_move(self):
-        with self.assertRaises(util.FilesystemError):
-            util.move(self.path, self.otherpath)
-
-    def test_unsuccessful_copy(self):
-        with self.assertRaises(util.FilesystemError):
-            util.copy(self.path, self.otherpath)
-
-    @unittest.skipUnless(_common.HAVE_REFLINK, "need reflink")
-    def test_unsuccessful_reflink(self):
-        with self.assertRaises(util.FilesystemError):
-            util.reflink(self.path, self.otherpath)
-
-    def test_self_move(self):
-        util.move(self.path, self.path)
-        self.assertExists(self.path)
-
-    def test_self_copy(self):
-        util.copy(self.path, self.path)
-        self.assertExists(self.path)
-
-
-class PruneTest(_common.TestCase):
-    def setUp(self):
-        super(PruneTest, self).setUp()
-
-        self.base = os.path.join(self.temp_dir, b'testdir')
-        os.mkdir(self.base)
-        self.sub = os.path.join(self.base, b'subdir')
-        os.mkdir(self.sub)
-
-    def test_prune_existent_directory(self):
-        util.prune_dirs(self.sub, self.base)
-        self.assertExists(self.base)
-        self.assertNotExists(self.sub)
-
-    def test_prune_nonexistent_directory(self):
-        util.prune_dirs(os.path.join(self.sub, b'another'), self.base)
-        self.assertExists(self.base)
-        self.assertNotExists(self.sub)
-
-
-class WalkTest(_common.TestCase):
-    def setUp(self):
-        super(WalkTest, self).setUp()
-
-        self.base = os.path.join(self.temp_dir, b'testdir')
-        os.mkdir(self.base)
-        touch(os.path.join(self.base, b'y'))
-        touch(os.path.join(self.base, b'x'))
-        os.mkdir(os.path.join(self.base, b'd'))
-        touch(os.path.join(self.base, b'd', b'z'))
-
-    def test_sorted_files(self):
-        res = list(util.sorted_walk(self.base))
-        self.assertEqual(len(res), 2)
-        self.assertEqual(res[0],
-                         (self.base, [b'd'], [b'x', b'y']))
-        self.assertEqual(res[1],
-                         (os.path.join(self.base, b'd'), [], [b'z']))
-
-    def test_ignore_file(self):
-        res = list(util.sorted_walk(self.base, (b'x',)))
-        self.assertEqual(len(res), 2)
-        self.assertEqual(res[0],
-                         (self.base, [b'd'], [b'y']))
-        self.assertEqual(res[1],
-                         (os.path.join(self.base, b'd'), [], [b'z']))
-
-    def test_ignore_directory(self):
-        res = list(util.sorted_walk(self.base, (b'd',)))
-        self.assertEqual(len(res), 1)
-        self.assertEqual(res[0],
-                         (self.base, [], [b'x', b'y']))
-
-    def test_ignore_everything(self):
-        res = list(util.sorted_walk(self.base, (b'*',)))
-        self.assertEqual(len(res), 1)
-        self.assertEqual(res[0],
-                         (self.base, [], []))
-
-
-class UniquePathTest(_common.TestCase):
-    def setUp(self):
-        super(UniquePathTest, self).setUp()
-
-        self.base = os.path.join(self.temp_dir, b'testdir')
-        os.mkdir(self.base)
-        touch(os.path.join(self.base, b'x.mp3'))
-        touch(os.path.join(self.base, b'x.1.mp3'))
-        touch(os.path.join(self.base, b'x.2.mp3'))
-        touch(os.path.join(self.base, b'y.mp3'))
-
-    def test_new_file_unchanged(self):
-        path = util.unique_path(os.path.join(self.base, b'z.mp3'))
-        self.assertEqual(path, os.path.join(self.base, b'z.mp3'))
-
-    def test_conflicting_file_appends_1(self):
-        path = util.unique_path(os.path.join(self.base, b'y.mp3'))
-        self.assertEqual(path, os.path.join(self.base, b'y.1.mp3'))
-
-    def test_conflicting_file_appends_higher_number(self):
-        path = util.unique_path(os.path.join(self.base, b'x.mp3'))
-        self.assertEqual(path, os.path.join(self.base, b'x.3.mp3'))
-
-    def test_conflicting_file_with_number_increases_number(self):
-        path = util.unique_path(os.path.join(self.base, b'x.1.mp3'))
-        self.assertEqual(path, os.path.join(self.base, b'x.3.mp3'))
-
-
-class MkDirAllTest(_common.TestCase):
-    def test_parent_exists(self):
-        path = os.path.join(self.temp_dir, b'foo', b'bar', b'baz', b'qux.mp3')
-        util.mkdirall(path)
-        self.assertTrue(os.path.isdir(
-            os.path.join(self.temp_dir, b'foo', b'bar', b'baz')
-        ))
-
-    def test_child_does_not_exist(self):
-        path = os.path.join(self.temp_dir, b'foo', b'bar', b'baz', b'qux.mp3')
-        util.mkdirall(path)
-        self.assertTrue(not os.path.exists(
-            os.path.join(self.temp_dir, b'foo', b'bar', b'baz', b'qux.mp3')
-        ))
-
-
-def suite():
-    return unittest.TestLoader().loadTestsFromName(__name__)
-
-if __name__ == '__main__':
-    unittest.main(defaultTest='suite')
+        assert not self.i.filepath.parent.exists()

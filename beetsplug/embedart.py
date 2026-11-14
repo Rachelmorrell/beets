@@ -1,44 +1,60 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Allows beets to embed album art into file metadata."""
-from __future__ import division, absolute_import, print_function
 
-import os.path
+from __future__ import annotations
 
+import os
+import tempfile
+from mimetypes import guess_extension
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
+
+import requests
+
+from beets import config, ui
+from beets.exceptions import UserError
 from beets.plugins import BeetsPlugin
-from beets import ui
-from beets.ui import print_, decargs
-from beets.util import syspath, normpath, displayable_path, bytestring_path
+from beets.ui import print_
+from beets.util import normpath, syspath
 from beets.util.artresizer import ArtResizer
-from beets import config
-from beets import art
+from beetsplug._utils import art
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from beets.importer import ImportSession, ImportTask
+    from beets.library import Album, LibModel, Library
 
 
-def _confirm(objs, album):
+class EmbedArtCLIOpts(Protocol):
+    file: str | None
+    limit: int | None
+    url: str | None
+    yes: bool | None
+
+
+class ExtractArtCLIOpts(Protocol):
+    associate: bool | None
+    filename: str | None
+    limit: int | None
+    outpath: str | None
+
+
+class ClearArtCLIOpts(Protocol):
+    limit: int | None
+    yes: bool | None
+
+
+def _confirm(objs: Sequence[LibModel], album: bool) -> bool:
     """Show the list of affected objects (items or albums) and confirm
     that the user wants to modify their artwork.
 
     `album` is a Boolean indicating whether these are albums (as opposed
     to items).
     """
-    noun = u'album' if album else u'file'
-    prompt = u'Modify artwork for {} {}{} (Y/n)?'.format(
-        len(objs),
-        noun,
-        u's' if len(objs) > 1 else u''
+    noun = "album" if album else "file"
+    prompt = (
+        "Modify artwork for"
+        f" {len(objs)} {noun}{'s' if len(objs) > 1 else ''} (Y/n)?"
     )
 
     # Show all the items or albums.
@@ -50,154 +66,249 @@ def _confirm(objs, album):
 
 
 class EmbedCoverArtPlugin(BeetsPlugin):
-    """Allows albumart to be embedded into the actual files.
-    """
-    def __init__(self):
-        super(EmbedCoverArtPlugin, self).__init__()
-        self.config.add({
-            'maxwidth': 0,
-            'auto': True,
-            'compare_threshold': 0,
-            'ifempty': False,
-            'remove_art_file': False,
-            'quality': 0,
-        })
+    """Allows albumart to be embedded into the actual files."""
 
-        if self.config['maxwidth'].get(int) and not ArtResizer.shared.local:
-            self.config['maxwidth'] = 0
-            self._log.warning(u"ImageMagick or PIL not found; "
-                              u"'maxwidth' option ignored")
-        if self.config['compare_threshold'].get(int) and not \
-                ArtResizer.shared.can_compare:
-            self.config['compare_threshold'] = 0
-            self._log.warning(u"ImageMagick 6.8.7 or higher not installed; "
-                              u"'compare_threshold' option ignored")
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.add(
+            {
+                "maxwidth": 0,
+                "auto": True,
+                "compare_threshold": 0,
+                "ifempty": False,
+                "remove_art_file": False,
+                "quality": 0,
+                "clearart_on_import": False,
+            }
+        )
 
-        self.register_listener('art_set', self.process_album)
+        if self.config["maxwidth"].get(int) and not ArtResizer.shared.local:
+            self.config["maxwidth"] = 0
+            self._log.warning(
+                "ImageMagick or PIL not found; 'maxwidth' option ignored"
+            )
+        if (
+            self.config["compare_threshold"].get(int)
+            and not ArtResizer.shared.can_compare
+        ):
+            self.config["compare_threshold"] = 0
+            self._log.warning(
+                "ImageMagick 6.8.7 or higher not installed; "
+                "'compare_threshold' option ignored"
+            )
 
-    def commands(self):
+        self.register_listener("art_set", self.process_album)
+
+        if self.config["clearart_on_import"].get(bool):
+            self.register_listener("import_task_files", self.import_task_files)
+
+    def commands(self) -> list[ui.Subcommand]:
         # Embed command.
         embed_cmd = ui.Subcommand(
-            'embedart', help=u'embed image files into file metadata'
+            "embedart", help="embed image files into file metadata"
         )
         embed_cmd.parser.add_option(
-            u'-f', u'--file', metavar='PATH', help=u'the image file to embed'
+            "-f", "--file", metavar="PATH", help="the image file to embed"
         )
-        embed_cmd.parser.add_option(
-            u"-y", u"--yes", action="store_true", help=u"skip confirmation"
-        )
-        maxwidth = self.config['maxwidth'].get(int)
-        quality = self.config['quality'].get(int)
-        compare_threshold = self.config['compare_threshold'].get(int)
-        ifempty = self.config['ifempty'].get(bool)
 
-        def embed_func(lib, opts, args):
+        embed_cmd.parser.add_option(
+            "-y", "--yes", action="store_true", help="skip confirmation"
+        )
+
+        embed_cmd.parser.add_option(
+            "-u",
+            "--url",
+            metavar="URL",
+            help="the URL of the image file to embed",
+        )
+
+        maxwidth = self.config["maxwidth"].get(int)
+        quality = self.config["quality"].get(int)
+        compare_threshold = self.config["compare_threshold"].get(int)
+        ifempty = self.config["ifempty"].get(bool)
+
+        def embed_func(
+            lib: Library, opts: EmbedArtCLIOpts, args: list[str]
+        ) -> None:
             if opts.file:
-                imagepath = normpath(opts.file)
-                if not os.path.isfile(syspath(imagepath)):
-                    raise ui.UserError(u'image file {0} not found'.format(
-                        displayable_path(imagepath)
-                    ))
+                imagepath = normpath(Path(opts.file))
+                if not imagepath.is_file():
+                    raise UserError(f"image file {imagepath} not found")
 
-                items = lib.items(decargs(args))
+                items = lib.items(args, limit=opts.limit)
 
                 # Confirm with user.
                 if not opts.yes and not _confirm(items, not opts.file):
                     return
 
                 for item in items:
-                    art.embed_item(self._log, item, imagepath, maxwidth,
-                                   None, compare_threshold, ifempty,
-                                   quality=quality)
+                    art.embed_item(
+                        self._log,
+                        item,
+                        imagepath,
+                        maxwidth,
+                        None,
+                        compare_threshold,
+                        ifempty,
+                        quality=quality,
+                    )
+            elif opts.url:
+                try:
+                    response = requests.get(opts.url, timeout=5)
+                    response.raise_for_status()
+                except requests.exceptions.RequestException as e:
+                    self._log.error("{}", e)
+                    return
+                extension = guess_extension(response.headers["Content-Type"])
+                if extension is None:
+                    self._log.error("Invalid image file")
+                    return
+                file = f"image{extension}"
+                tempimg = Path(tempfile.gettempdir()) / file
+                try:
+                    with tempimg.open("wb") as f:
+                        f.write(response.content)
+                except Exception as e:
+                    self._log.error("Unable to save image: {}", e)
+                    return
+                items = lib.items(args, limit=opts.limit)
+                # Confirm with user.
+                if not opts.yes and not _confirm(items, not opts.url):
+                    tempimg.unlink()
+                    return
+                for item in items:
+                    art.embed_item(
+                        self._log,
+                        item,
+                        tempimg,
+                        maxwidth,
+                        None,
+                        compare_threshold,
+                        ifempty,
+                        quality=quality,
+                    )
+                tempimg.unlink()
             else:
-                albums = lib.albums(decargs(args))
-
+                albums = lib.albums(args, limit=opts.limit)
                 # Confirm with user.
                 if not opts.yes and not _confirm(albums, not opts.file):
                     return
-
                 for album in albums:
-                    art.embed_album(self._log, album, maxwidth,
-                                    False, compare_threshold, ifempty,
-                                    quality=quality)
+                    art.embed_album(
+                        self._log,
+                        album,
+                        maxwidth,
+                        False,
+                        compare_threshold,
+                        ifempty,
+                        quality=quality,
+                    )
                     self.remove_artfile(album)
 
+        embed_cmd.parser.add_limit_option()
         embed_cmd.func = embed_func
 
         # Extract command.
         extract_cmd = ui.Subcommand(
-            'extractart',
-            help=u'extract an image from file metadata',
+            "extractart", help="extract an image from file metadata"
         )
         extract_cmd.parser.add_option(
-            u'-o', dest='outpath',
-            help=u'image output file',
+            "-o", dest="outpath", help="image output file"
         )
         extract_cmd.parser.add_option(
-            u'-n', dest='filename',
-            help=u'image filename to create for all matched albums',
+            "-n",
+            dest="filename",
+            help="image filename to create for all matched albums",
         )
         extract_cmd.parser.add_option(
-            '-a', dest='associate', action='store_true',
-            help='associate the extracted images with the album',
+            "-a",
+            dest="associate",
+            action="store_true",
+            help="associate the extracted images with the album",
         )
 
-        def extract_func(lib, opts, args):
+        def extract_func(
+            lib: Library, opts: ExtractArtCLIOpts, args: list[str]
+        ) -> None:
             if opts.outpath:
-                art.extract_first(self._log, normpath(opts.outpath),
-                                  lib.items(decargs(args)))
+                art.extract_first(
+                    self._log,
+                    normpath(Path(opts.outpath)),
+                    lib.items(args, limit=opts.limit),
+                )
             else:
-                filename = bytestring_path(opts.filename or
-                                           config['art_filename'].get())
-                if os.path.dirname(filename) != b'':
+                filename = Path(opts.filename or config["art_filename"].get())
+                if filename.parent != Path():
                     self._log.error(
-                        u"Only specify a name rather than a path for -n")
+                        "Only specify a name rather than a path for -n"
+                    )
                     return
-                for album in lib.albums(decargs(args)):
-                    artpath = normpath(os.path.join(album.path, filename))
-                    artpath = art.extract_first(self._log, artpath,
-                                                album.items())
-                    if artpath and opts.associate:
+                for album in lib.albums(args, limit=opts.limit):
+                    if opts.associate and (
+                        artpath := art.extract_first(
+                            self._log, album.filepath / filename, album.items()
+                        )
+                    ):
                         album.set_art(artpath)
                         album.store()
+
+        extract_cmd.parser.add_limit_option()
         extract_cmd.func = extract_func
 
         # Clear command.
         clear_cmd = ui.Subcommand(
-            'clearart',
-            help=u'remove images from file metadata',
+            "clearart", help="remove images from file metadata"
         )
         clear_cmd.parser.add_option(
-            u"-y", u"--yes", action="store_true", help=u"skip confirmation"
+            "-y", "--yes", action="store_true", help="skip confirmation"
         )
 
-        def clear_func(lib, opts, args):
-            items = lib.items(decargs(args))
+        def clear_func(
+            lib: Library, opts: ClearArtCLIOpts, args: list[str]
+        ) -> None:
+            items = lib.items(args, limit=opts.limit)
             # Confirm with user.
             if not opts.yes and not _confirm(items, False):
                 return
-            art.clear(self._log, lib, decargs(args))
+            art.clear(self._log, lib, args, opts.limit)
+
+        clear_cmd.parser.add_limit_option()
         clear_cmd.func = clear_func
 
         return [embed_cmd, extract_cmd, clear_cmd]
 
-    def process_album(self, album):
-        """Automatically embed art after art has been set
-        """
-        if self.config['auto'] and ui.should_write():
-            max_width = self.config['maxwidth'].get(int)
-            art.embed_album(self._log, album, max_width, True,
-                            self.config['compare_threshold'].get(int),
-                            self.config['ifempty'].get(bool))
+    def process_album(self, album: Album) -> None:
+        """Automatically embed art after art has been set"""
+        if self.config["auto"] and ui.should_write():
+            max_width = self.config["maxwidth"].get(int)
+            art.embed_album(
+                self._log,
+                album,
+                max_width,
+                True,
+                self.config["compare_threshold"].get(int),
+                self.config["ifempty"].get(bool),
+            )
             self.remove_artfile(album)
 
-    def remove_artfile(self, album):
+    def remove_artfile(self, album: Album) -> None:
         """Possibly delete the album art file for an album (if the
         appropriate configuration option is enabled).
         """
-        if self.config['remove_art_file'] and album.artpath:
-            if os.path.isfile(album.artpath):
-                self._log.debug(u'Removing album art file for {0}', album)
-                os.remove(album.artpath)
-                album.artpath = None
-                album.store()
+        if (
+            self.config["remove_art_file"]
+            and album.artpath
+            and os.path.isfile(syspath(album.artpath))
+        ):
+            self._log.debug("Removing album art file for {}", album)
+            os.remove(syspath(album.artpath))
+            album.artpath = None
+            album.store()
+
+    def import_task_files(
+        self, session: ImportSession, task: ImportTask
+    ) -> None:
+        """Automatically clearart of imported files."""
+        for item in task.imported_items():
+            self._log.debug("clearart-on-import {.filepath}", item)
+            art.clear_item(item, self._log)

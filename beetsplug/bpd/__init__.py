@@ -1,57 +1,62 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """A clone of the Music Player Daemon (MPD) that plays music from a
 Beets library. Attempts to implement a compatible protocol to allow
 use of the wide range of MPD clients.
 """
 
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
 
-import re
-import sys
-from string import Template
-import traceback
-import random
-import time
-import math
+import asyncio
+import contextlib
 import inspect
+import math
+import random
+import re
 import socket
+import sys
+import time
+import traceback
+from string import Template
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, overload
 
 import beets
-from beets.plugins import BeetsPlugin
 import beets.ui
-from beets import vfs
-from beets.util import bluelet
-from beets.library import Item
 from beets import dbcore
-from mediafile import MediaFile
-import six
+from beets.exceptions import UserError
+from beets.library import Item
+from beets.plugins import BeetsPlugin
+from beetsplug._utils import vfs
 
-PROTOCOL_VERSION = '0.16.0'
+if TYPE_CHECKING:
+    import optparse
+    from collections.abc import Iterable, Iterator
+    from typing import Literal
+
+    from beets.dbcore.query import FieldQueryType, Query
+    from beets.library import Library
+    from beets.logging import BeetsLogger as Logger
+    from beetsplug._utils.vfs import Node
+
+
+try:
+    from . import gstplayer
+except ImportError as e:
+    raise ImportError(
+        "Gstreamer Python bindings not found."
+        ' Install "gstreamer1.0" and "python-gi" or similar package to use BPD.'
+    ) from e
+
+PROTOCOL_VERSION = "0.16.0"
 BUFSIZE = 1024
 
-HELLO = u'OK MPD %s' % PROTOCOL_VERSION
-CLIST_BEGIN = u'command_list_begin'
-CLIST_VERBOSE_BEGIN = u'command_list_ok_begin'
-CLIST_END = u'command_list_end'
-RESP_OK = u'OK'
-RESP_CLIST_VERBOSE = u'list_OK'
-RESP_ERR = u'ACK'
+HELLO = f"OK MPD {PROTOCOL_VERSION}"
+CLIST_BEGIN = "command_list_begin"
+CLIST_VERBOSE_BEGIN = "command_list_ok_begin"
+CLIST_END = "command_list_end"
+RESP_OK = "OK"
+RESP_CLIST_VERBOSE = "list_OK"
+RESP_ERR = "ACK"
 
-NEWLINE = u"\n"
+NEWLINE = "\n"
 
 ERROR_NOT_LIST = 1
 ERROR_ARG = 2
@@ -71,106 +76,130 @@ VOLUME_MAX = 100
 
 SAFE_COMMANDS = (
     # Commands that are available when unauthenticated.
-    u'close', u'commands', u'notcommands', u'password', u'ping',
+    "close",
+    "commands",
+    "notcommands",
+    "password",
+    "ping",
 )
 
 # List of subsystems/events used by the `idle` command.
 SUBSYSTEMS = [
-    u'update', u'player', u'mixer', u'options', u'playlist', u'database',
+    "update",
+    "player",
+    "mixer",
+    "options",
+    "playlist",
+    "database",
     # Related to unsupported commands:
-    u'stored_playlist', u'output', u'subscription', u'sticker', u'message',
-    u'partition',
+    "stored_playlist",
+    "output",
+    "subscription",
+    "sticker",
+    "message",
+    "partition",
 ]
-
-ITEM_KEYS_WRITABLE = set(MediaFile.fields()).intersection(Item._fields.keys())
-
-
-# Gstreamer import error.
-class NoGstreamerError(Exception):
-    pass
 
 
 # Error-handling, exceptions, parameter parsing.
+
 
 class BPDError(Exception):
     """An error that should be exposed to the client to the BPD
     server.
     """
-    def __init__(self, code, message, cmd_name='', index=0):
+
+    def __init__(
+        self, code: int, message: str, cmd_name: str = "", index: int = 0
+    ) -> None:
         self.code = code
         self.message = message
         self.cmd_name = cmd_name
         self.index = index
 
-    template = Template(u'$resp [$code@$index] {$cmd_name} $message')
+    template = Template("$resp [$code@$index] {$cmd_name} $message")
 
-    def response(self):
+    def response(self) -> str:
         """Returns a string to be used as the response code for the
         erring command.
         """
-        return self.template.substitute({
-            'resp':     RESP_ERR,
-            'code':     self.code,
-            'index':    self.index,
-            'cmd_name': self.cmd_name,
-            'message':  self.message,
-        })
+        return self.template.substitute(
+            {
+                "resp": RESP_ERR,
+                "code": self.code,
+                "index": self.index,
+                "cmd_name": self.cmd_name,
+                "message": self.message,
+            }
+        )
 
 
-def make_bpd_error(s_code, s_message):
-    """Create a BPDError subclass for a static code and message.
-    """
+def make_bpd_error(s_code: int, s_message: str) -> type[Exception]:
+    """Create a BPDError subclass for a static code and message."""
 
     class NewBPDError(BPDError):
         code = s_code
         message = s_message
-        cmd_name = ''
+        cmd_name = ""
         index = 0
 
-        def __init__(self):
+        def __init__(self) -> None:
             pass
+
     return NewBPDError
 
-ArgumentTypeError = make_bpd_error(ERROR_ARG, u'invalid type for argument')
-ArgumentIndexError = make_bpd_error(ERROR_ARG, u'argument out of range')
-ArgumentNotFoundError = make_bpd_error(ERROR_NO_EXIST, u'argument not found')
+
+ArgumentTypeError = make_bpd_error(ERROR_ARG, "invalid type for argument")
+ArgumentIndexError = make_bpd_error(ERROR_ARG, "argument out of range")
+ArgumentNotFoundError = make_bpd_error(ERROR_NO_EXIST, "argument not found")
 
 
-def cast_arg(t, val):
+@overload
+def cast_arg(t: type[bool], val: str | int | float | bool) -> bool: ...
+@overload
+def cast_arg(t: type[int], val: str | int | float | bool) -> int: ...
+@overload
+def cast_arg(t: type[float], val: str | int | float | bool) -> float: ...
+@overload
+def cast_arg(t: Literal["intbool"], val: str | int | float | bool) -> bool: ...
+def cast_arg(
+    t: type[bool | int | float] | Literal["intbool"],
+    val: str | int | float | bool,
+) -> Any:
     """Attempts to call t on val, raising a ArgumentTypeError
     on ValueError.
 
     If 't' is the special string 'intbool', attempts to cast first
     to an int and then to a bool (i.e., 1=True, 0=False).
     """
-    if t == 'intbool':
+    if t == "intbool":
         return cast_arg(bool, cast_arg(int, val))
-    else:
-        try:
-            return t(val)
-        except ValueError:
-            raise ArgumentTypeError()
+    try:
+        return t(val)
+    except ValueError:
+        raise ArgumentTypeError()
 
 
-class BPDClose(Exception):
+class BPDCloseError(Exception):
     """Raised by a command invocation to indicate that the connection
     should be closed.
     """
 
 
-class BPDIdle(Exception):
+class BPDIdleError(Exception):
     """Raised by a command to indicate the client wants to enter the idle state
     and should be notified when a relevant event happens.
     """
-    def __init__(self, subsystems):
-        super(BPDIdle, self).__init__()
+
+    def __init__(self, subsystems: Iterable[str]) -> None:
+        super().__init__()
         self.subsystems = set(subsystems)
 
 
 # Generic server infrastructure, implementing the basic protocol.
 
 
-class BaseServer(object):
+class BaseServer:
     """A MPD-compatible music player server.
 
     The functions with the `cmd_` prefix are invoked in response to
@@ -183,7 +212,19 @@ class BaseServer(object):
     This is a generic superclass and doesn't support many commands.
     """
 
-    def __init__(self, host, port, password, ctrl_port, log, ctrl_host=None):
+    playlist: list[Item]
+    connections: set[MPDConnection]
+    ctrl_sock: socket.socket | None
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        password: str,
+        ctrl_port: int,
+        log: Logger,
+        ctrl_host: str | None = None,
+    ) -> None:
         """Create a new server bound to address `host` and listening
         on port `port`. If `password` is given, it is required to do
         anything significant on the server.
@@ -204,8 +245,8 @@ class BaseServer(object):
         self.volume = VOLUME_MAX
         self.crossfade = 0
         self.mixrampdb = 0.0
-        self.mixrampdelay = float('nan')
-        self.replay_gain_mode = 'off'
+        self.mixrampdelay = float("nan")
+        self.replay_gain_mode = "off"
         self.playlist = []
         self.playlist_version = 0
         self.current_index = -1
@@ -214,43 +255,77 @@ class BaseServer(object):
 
         # Current connections
         self.connections = set()
+        self._notification_tasks: dict[MPDConnection, asyncio.Task[None]] = {}
 
         # Object for random numbers generation
         self.random_obj = random.Random()
 
-    def connect(self, conn):
-        """A new client has connected.
-        """
+    def connect(self, conn: MPDConnection) -> None:
+        """A new client has connected."""
         self.connections.add(conn)
 
-    def disconnect(self, conn):
-        """Client has disconnected; clean up residual state.
-        """
-        self.connections.remove(conn)
+    def disconnect(self, conn: MPDConnection) -> None:
+        """Client has disconnected; clean up residual state."""
+        self.connections.discard(conn)
 
-    def run(self):
+    def run(self) -> None:
         """Block and start listening for connections from clients. An
         interrupt (^C) closes the server.
         """
+        asyncio.run(self._run())
+
+    async def _run(self) -> None:
+        """Serve MPD and control connections in one event loop."""
         self.startup_time = time.time()
 
-        def start():
-            yield bluelet.spawn(
-                    bluelet.server(self.ctrl_host, self.ctrl_port,
-                                   ControlConnection.handler(self)))
-            yield bluelet.server(self.host, self.port,
-                                 MPDConnection.handler(self))
-        bluelet.run(start())
+        async with (
+            await asyncio.start_server(
+                ControlConnection.handler(self),
+                self.ctrl_host,
+                self.ctrl_port,
+                family=socket.AF_INET,
+            ) as control_server,
+            await asyncio.start_server(
+                MPDConnection.handler(self),
+                self.host,
+                self.port,
+                family=socket.AF_INET,
+            ) as mpd_server,
+        ):
+            await asyncio.gather(
+                control_server.serve_forever(), mpd_server.serve_forever()
+            )
 
-    def dispatch_events(self):
-        """If any clients have idle events ready, send them.
-        """
+    def dispatch_events(self) -> None:
+        """If any clients have idle events ready, send them."""
         # We need a copy of `self.connections` here since clients might
         # disconnect once we try and send to them, changing `self.connections`.
         for conn in list(self.connections):
-            yield bluelet.spawn(conn.send_notifications())
+            self._dispatch_connection_events(conn)
 
-    def _ctrl_send(self, message):
+    def _dispatch_connection_events(self, conn: MPDConnection) -> None:
+        """Start sending queued events unless this connection is busy."""
+        if conn in self._notification_tasks:
+            return
+        task = asyncio.create_task(conn.send_notifications())
+        self._notification_tasks[conn] = task
+        task.add_done_callback(lambda task: self._notification_done(conn, task))
+
+    def _notification_done(
+        self, conn: MPDConnection, task: asyncio.Task[None]
+    ) -> None:
+        """Release a connection after its queued events have been sent."""
+        del self._notification_tasks[conn]
+        if task.cancelled():
+            return
+        if error := task.exception():
+            self._log.error("Could not send BPD notifications: {}", error)
+            return
+        pending = conn.notifications.intersection(conn.idle_subscriptions)
+        if conn in self.connections and pending:
+            self._dispatch_connection_events(conn)
+
+    def _ctrl_send(self, message: str) -> None:
         """Send some data over the control socket.
         If it's our first time, open the socket. The message should be a
         string without a terminal newline.
@@ -258,25 +333,24 @@ class BaseServer(object):
         if not self.ctrl_sock:
             self.ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.ctrl_sock.connect((self.ctrl_host, self.ctrl_port))
-        self.ctrl_sock.sendall((message + u'\n').encode('utf-8'))
+        self.ctrl_sock.sendall((f"{message}\n").encode())
 
-    def _send_event(self, event):
+    def _send_event(self, event: str) -> None:
         """Notify subscribed connections of an event."""
         for conn in self.connections:
             conn.notify(event)
 
-    def _item_info(self, item):
+    def _item_info(self, item: Item) -> list[str]:
         """An abstract method that should response lines containing a
         single song's metadata.
         """
         raise NotImplementedError
 
-    def _item_id(self, item):
-        """An abstract method returning the integer id for an item.
-        """
+    def _item_id(self, item: Item) -> int | None:
+        """An abstract method returning the integer id for an item."""
         raise NotImplementedError
 
-    def _id_to_index(self, track_id):
+    def _id_to_index(self, track_id: int) -> int:
         """Searches the playlist for a song with the given id and
         returns its index in the playlist.
         """
@@ -287,7 +361,7 @@ class BaseServer(object):
         # Loop finished with no track found.
         raise ArgumentNotFoundError()
 
-    def _random_idx(self):
+    def _random_idx(self) -> int:
         """Returns a random index different from the current one.
         If there are no songs in the playlist it returns -1.
         If there is only one song in the playlist it returns 0.
@@ -299,7 +373,7 @@ class BaseServer(object):
             new_index = self.random_obj.randint(0, len(self.playlist) - 1)
         return new_index
 
-    def _succ_idx(self):
+    def _succ_idx(self) -> int:
         """Returns the index for the next song to play.
         It also considers random, single and repeat flags.
         No boundaries are checked.
@@ -310,7 +384,7 @@ class BaseServer(object):
             return self._random_idx()
         return self.current_index + 1
 
-    def _prev_idx(self):
+    def _prev_idx(self) -> int:
         """Returns the index for the previous song to play.
         It also considers random and repeat flags.
         No boundaries are checked.
@@ -321,62 +395,60 @@ class BaseServer(object):
             return self._random_idx()
         return self.current_index - 1
 
-    def cmd_ping(self, conn):
+    def cmd_ping(self, conn: MPDConnection) -> None:
         """Succeeds."""
-        pass
 
-    def cmd_idle(self, conn, *subsystems):
-        subsystems = subsystems or SUBSYSTEMS
+    def cmd_idle(self, conn: MPDConnection, *subsystems: str) -> NoReturn:
+        subsystems = tuple(subsystems or SUBSYSTEMS)
         for system in subsystems:
             if system not in SUBSYSTEMS:
-                raise BPDError(ERROR_ARG,
-                               u'Unrecognised idle event: {}'.format(system))
-        raise BPDIdle(subsystems)  # put the connection into idle mode
+                raise BPDError(ERROR_ARG, f"Unrecognised idle event: {system}")
+        raise BPDIdleError(subsystems)  # put the connection into idle mode
 
-    def cmd_kill(self, conn):
+    def cmd_kill(self, conn: MPDConnection) -> None:
         """Exits the server process."""
         sys.exit(0)
 
-    def cmd_close(self, conn):
+    def cmd_close(self, conn: MPDConnection) -> NoReturn:
         """Closes the connection."""
-        raise BPDClose()
+        raise BPDCloseError()
 
-    def cmd_password(self, conn, password):
+    def cmd_password(self, conn: MPDConnection, password: str) -> None:
         """Attempts password authentication."""
         if password == self.password:
             conn.authenticated = True
         else:
             conn.authenticated = False
-            raise BPDError(ERROR_PASSWORD, u'incorrect password')
+            raise BPDError(ERROR_PASSWORD, "incorrect password")
 
-    def cmd_commands(self, conn):
+    def cmd_commands(self, conn: MPDConnection) -> Iterator[Any]:
         """Lists the commands available to the user."""
         if self.password and not conn.authenticated:
             # Not authenticated. Show limited list of commands.
             for cmd in SAFE_COMMANDS:
-                yield u'command: ' + cmd
+                yield f"command: {cmd}"
 
         else:
             # Authenticated. Show all commands.
             for func in dir(self):
-                if func.startswith('cmd_'):
-                    yield u'command: ' + func[4:]
+                if func.startswith("cmd_"):
+                    yield f"command: {func[4:]}"
 
-    def cmd_notcommands(self, conn):
+    def cmd_notcommands(self, conn: MPDConnection) -> Iterator[Any]:
         """Lists all unavailable commands."""
         if self.password and not conn.authenticated:
             # Not authenticated. Show privileged commands.
             for func in dir(self):
-                if func.startswith('cmd_'):
+                if func.startswith("cmd_"):
                     cmd = func[4:]
                     if cmd not in SAFE_COMMANDS:
-                        yield u'command: ' + cmd
+                        yield f"command: {cmd}"
 
         else:
             # Authenticated. No commands are unavailable.
             pass
 
-    def cmd_status(self, conn):
+    def cmd_status(self, conn: MPDConnection) -> Iterator[Any]:
         """Returns some status information for use with an
         implementation of cmd_status.
 
@@ -384,136 +456,136 @@ class BaseServer(object):
         playlist, playlistlength, and xfade.
         """
         yield (
-            u'repeat: ' + six.text_type(int(self.repeat)),
-            u'random: ' + six.text_type(int(self.random)),
-            u'consume: ' + six.text_type(int(self.consume)),
-            u'single: ' + six.text_type(int(self.single)),
-            u'playlist: ' + six.text_type(self.playlist_version),
-            u'playlistlength: ' + six.text_type(len(self.playlist)),
-            u'mixrampdb: ' + six.text_type(self.mixrampdb),
+            f"repeat: {int(self.repeat)}",
+            f"random: {int(self.random)}",
+            f"consume: {int(self.consume)}",
+            f"single: {int(self.single)}",
+            f"playlist: {self.playlist_version}",
+            f"playlistlength: {len(self.playlist)}",
+            f"mixrampdb: {self.mixrampdb}",
         )
 
         if self.volume > 0:
-            yield u'volume: ' + six.text_type(self.volume)
+            yield f"volume: {self.volume}"
 
         if not math.isnan(self.mixrampdelay):
-            yield u'mixrampdelay: ' + six.text_type(self.mixrampdelay)
+            yield f"mixrampdelay: {self.mixrampdelay}"
         if self.crossfade > 0:
-            yield u'xfade: ' + six.text_type(self.crossfade)
+            yield f"xfade: {self.crossfade}"
 
         if self.current_index == -1:
-            state = u'stop'
+            state = "stop"
         elif self.paused:
-            state = u'pause'
+            state = "pause"
         else:
-            state = u'play'
-        yield u'state: ' + state
+            state = "play"
+        yield f"state: {state}"
 
         if self.current_index != -1:  # i.e., paused or playing
             current_id = self._item_id(self.playlist[self.current_index])
-            yield u'song: ' + six.text_type(self.current_index)
-            yield u'songid: ' + six.text_type(current_id)
+            yield f"song: {self.current_index}"
+            yield f"songid: {current_id}"
             if len(self.playlist) > self.current_index + 1:
                 # If there's a next song, report its index too.
                 next_id = self._item_id(self.playlist[self.current_index + 1])
-                yield u'nextsong: ' + six.text_type(self.current_index + 1)
-                yield u'nextsongid: ' + six.text_type(next_id)
+                yield f"nextsong: {self.current_index + 1}"
+                yield f"nextsongid: {next_id}"
 
         if self.error:
-            yield u'error: ' + self.error
+            yield f"error: {self.error}"
 
-    def cmd_clearerror(self, conn):
+    def cmd_clearerror(self, conn: MPDConnection) -> None:
         """Removes the persistent error state of the server. This
         error is set when a problem arises not in response to a
         command (for instance, when playing a file).
         """
         self.error = None
 
-    def cmd_random(self, conn, state):
+    def cmd_random(self, conn: MPDConnection, state: str) -> None:
         """Set or unset random (shuffle) mode."""
-        self.random = cast_arg('intbool', state)
-        self._send_event('options')
+        self.random = cast_arg("intbool", state)
+        self._send_event("options")
 
-    def cmd_repeat(self, conn, state):
+    def cmd_repeat(self, conn: MPDConnection, state: str) -> None:
         """Set or unset repeat mode."""
-        self.repeat = cast_arg('intbool', state)
-        self._send_event('options')
+        self.repeat = cast_arg("intbool", state)
+        self._send_event("options")
 
-    def cmd_consume(self, conn, state):
+    def cmd_consume(self, conn: MPDConnection, state: str) -> None:
         """Set or unset consume mode."""
-        self.consume = cast_arg('intbool', state)
-        self._send_event('options')
+        self.consume = cast_arg("intbool", state)
+        self._send_event("options")
 
-    def cmd_single(self, conn, state):
+    def cmd_single(self, conn: MPDConnection, state: str) -> None:
         """Set or unset single mode."""
         # TODO support oneshot in addition to 0 and 1 [MPD 0.20]
-        self.single = cast_arg('intbool', state)
-        self._send_event('options')
+        self.single = cast_arg("intbool", state)
+        self._send_event("options")
 
-    def cmd_setvol(self, conn, vol):
+    def cmd_setvol(self, conn: MPDConnection | None, vol: str | int) -> None:
         """Set the player's volume level (0-100)."""
         vol = cast_arg(int, vol)
         if vol < VOLUME_MIN or vol > VOLUME_MAX:
-            raise BPDError(ERROR_ARG, u'volume out of range')
+            raise BPDError(ERROR_ARG, "volume out of range")
         self.volume = vol
-        self._send_event('mixer')
+        self._send_event("mixer")
 
-    def cmd_volume(self, conn, vol_delta):
+    def cmd_volume(self, conn: MPDConnection, vol_delta: int) -> None:
         """Deprecated command to change the volume by a relative amount."""
         vol_delta = cast_arg(int, vol_delta)
         return self.cmd_setvol(conn, self.volume + vol_delta)
 
-    def cmd_crossfade(self, conn, crossfade):
+    def cmd_crossfade(self, conn: MPDConnection, crossfade: int) -> None:
         """Set the number of seconds of crossfading."""
         crossfade = cast_arg(int, crossfade)
         if crossfade < 0:
-            raise BPDError(ERROR_ARG, u'crossfade time must be nonnegative')
-        self._log.warning(u'crossfade is not implemented in bpd')
+            raise BPDError(ERROR_ARG, "crossfade time must be nonnegative")
+        self._log.warning("crossfade is not implemented in bpd")
         self.crossfade = crossfade
-        self._send_event('options')
+        self._send_event("options")
 
-    def cmd_mixrampdb(self, conn, db):
+    def cmd_mixrampdb(self, conn: MPDConnection, db: float) -> None:
         """Set the mixramp normalised max volume in dB."""
         db = cast_arg(float, db)
         if db > 0:
-            raise BPDError(ERROR_ARG, u'mixrampdb time must be negative')
-        self._log.warning('mixramp is not implemented in bpd')
+            raise BPDError(ERROR_ARG, "mixrampdb time must be negative")
+        self._log.warning("mixramp is not implemented in bpd")
         self.mixrampdb = db
-        self._send_event('options')
+        self._send_event("options")
 
-    def cmd_mixrampdelay(self, conn, delay):
+    def cmd_mixrampdelay(self, conn: MPDConnection, delay: float) -> None:
         """Set the mixramp delay in seconds."""
         delay = cast_arg(float, delay)
         if delay < 0:
-            raise BPDError(ERROR_ARG, u'mixrampdelay time must be nonnegative')
-        self._log.warning('mixramp is not implemented in bpd')
+            raise BPDError(ERROR_ARG, "mixrampdelay time must be nonnegative")
+        self._log.warning("mixramp is not implemented in bpd")
         self.mixrampdelay = delay
-        self._send_event('options')
+        self._send_event("options")
 
-    def cmd_replay_gain_mode(self, conn, mode):
+    def cmd_replay_gain_mode(self, conn: MPDConnection, mode: str) -> None:
         """Set the replay gain mode."""
-        if mode not in ['off', 'track', 'album', 'auto']:
-            raise BPDError(ERROR_ARG, u'Unrecognised replay gain mode')
-        self._log.warning('replay gain is not implemented in bpd')
+        if mode not in ["off", "track", "album", "auto"]:
+            raise BPDError(ERROR_ARG, "Unrecognised replay gain mode")
+        self._log.warning("replay gain is not implemented in bpd")
         self.replay_gain_mode = mode
-        self._send_event('options')
+        self._send_event("options")
 
-    def cmd_replay_gain_status(self, conn):
+    def cmd_replay_gain_status(self, conn: MPDConnection) -> Iterator[Any]:
         """Get the replaygain mode."""
-        yield u'replay_gain_mode: ' + six.text_type(self.replay_gain_mode)
+        yield f"replay_gain_mode: {self.replay_gain_mode}"
 
-    def cmd_clear(self, conn):
+    def cmd_clear(self, conn: MPDConnection) -> None:
         """Clear the playlist."""
         self.playlist = []
         self.playlist_version += 1
         self.cmd_stop(conn)
-        self._send_event('playlist')
+        self._send_event("playlist")
 
-    def cmd_delete(self, conn, index):
+    def cmd_delete(self, conn: MPDConnection, index: int) -> None:
         """Remove the song at index from the playlist."""
         index = cast_arg(int, index)
         try:
-            del(self.playlist[index])
+            del self.playlist[index]
         except IndexError:
             raise ArgumentIndexError()
         self.playlist_version += 1
@@ -523,12 +595,12 @@ class BaseServer(object):
         elif index < self.current_index:  # Deleted before playing.
             # Shift playing index down.
             self.current_index -= 1
-        self._send_event('playlist')
+        self._send_event("playlist")
 
-    def cmd_deleteid(self, conn, track_id):
+    def cmd_deleteid(self, conn: MPDConnection, track_id: int) -> None:
         self.cmd_delete(conn, self._id_to_index(track_id))
 
-    def cmd_move(self, conn, idx_from, idx_to):
+    def cmd_move(self, conn: MPDConnection, idx_from: int, idx_to: int) -> None:
         """Move a track in the playlist."""
         idx_from = cast_arg(int, idx_from)
         idx_to = cast_arg(int, idx_to)
@@ -547,13 +619,15 @@ class BaseServer(object):
             self.current_index += 1
 
         self.playlist_version += 1
-        self._send_event('playlist')
+        self._send_event("playlist")
 
-    def cmd_moveid(self, conn, idx_from, idx_to):
+    def cmd_moveid(
+        self, conn: MPDConnection, idx_from: int, idx_to: int
+    ) -> None:
         idx_from = self._id_to_index(idx_from)
         return self.cmd_move(conn, idx_from, idx_to)
 
-    def cmd_swap(self, conn, i, j):
+    def cmd_swap(self, conn: MPDConnection, i: int, j: int) -> None:
         """Swaps two tracks in the playlist."""
         i = cast_arg(int, i)
         j = cast_arg(int, j)
@@ -573,18 +647,35 @@ class BaseServer(object):
             self.current_index = i
 
         self.playlist_version += 1
-        self._send_event('playlist')
+        self._send_event("playlist")
 
-    def cmd_swapid(self, conn, i_id, j_id):
+    def cmd_swapid(self, conn: MPDConnection, i_id: int, j_id: int) -> None:
         i = self._id_to_index(i_id)
         j = self._id_to_index(j_id)
         return self.cmd_swap(conn, i, j)
 
-    def cmd_urlhandlers(self, conn):
+    def cmd_urlhandlers(self, conn: MPDConnection) -> None:
         """Indicates supported URL schemes. None by default."""
-        pass
 
-    def cmd_playlistinfo(self, conn, index=None):
+    @staticmethod
+    def _parse_range(
+        items: str | int, accept_single_number: bool = False
+    ) -> list[int] | range:
+        """Convert a range of positions to a list of item info.
+        MPD specifies ranges as START:STOP (endpoint excluded) for some
+        commands. Sometimes a single number can be provided instead.
+        """
+        try:
+            start, stop = str(items).split(":", 1)
+        except ValueError:
+            if accept_single_number:
+                return [cast_arg(int, items)]
+            raise BPDError(ERROR_ARG, "bad range syntax")
+        return range(cast_arg(int, start), cast_arg(int, stop))
+
+    def cmd_playlistinfo(
+        self, conn: MPDConnection, index: str | int | None = None
+    ) -> Iterator[Any]:
         """Gives metadata information about the entire playlist or a
         single track, given by its index.
         """
@@ -600,13 +691,15 @@ class BaseServer(object):
             for track in tracks:
                 yield self._item_info(track)
 
-    def cmd_playlistid(self, conn, track_id=None):
+    def cmd_playlistid(
+        self, conn: MPDConnection, track_id: int | None = None
+    ) -> Iterator[Any]:
         if track_id is not None:
             track_id = cast_arg(int, track_id)
             track_id = self._id_to_index(track_id)
         return self.cmd_playlistinfo(conn, track_id)
 
-    def cmd_plchanges(self, conn, version):
+    def cmd_plchanges(self, conn: MPDConnection, version: str) -> Iterator[Any]:
         """Sends playlist changes since the given version.
 
         This is a "fake" implementation that ignores the version and
@@ -615,23 +708,24 @@ class BaseServer(object):
         """
         return self.cmd_playlistinfo(conn)
 
-    def cmd_plchangesposid(self, conn, version):
+    def cmd_plchangesposid(
+        self, conn: MPDConnection, version: str
+    ) -> Iterator[Any]:
         """Like plchanges, but only sends position and id.
 
         Also a dummy implementation.
         """
         for idx, track in enumerate(self.playlist):
-            yield u'cpos: ' + six.text_type(idx)
-            yield u'Id: ' + six.text_type(track.id)
+            yield f"cpos: {idx}"
+            yield f"Id: {track.id}"
 
-    def cmd_currentsong(self, conn):
-        """Sends information about the currently-playing song.
-        """
+    def cmd_currentsong(self, conn: MPDConnection) -> Iterator[Any]:
+        """Sends information about the currently-playing song."""
         if self.current_index != -1:  # -1 means stopped.
             track = self.playlist[self.current_index]
             yield self._item_info(track)
 
-    def cmd_next(self, conn):
+    def cmd_next(self, conn: MPDConnection | None) -> None:
         """Advance to the next song in the playlist."""
         old_index = self.current_index
         self.current_index = self._succ_idx()
@@ -648,12 +742,11 @@ class BaseServer(object):
                 self.current_index = -1
                 return self.cmd_play(conn)
             return self.cmd_stop(conn)
-        elif self.single and not self.repeat:
+        if self.single and not self.repeat:
             return self.cmd_stop(conn)
-        else:
-            return self.cmd_play(conn)
+        return self.cmd_play(conn)
 
-    def cmd_previous(self, conn):
+    def cmd_previous(self, conn: MPDConnection) -> None:
         """Step back to the last song."""
         old_index = self.current_index
         self.current_index = self._prev_idx()
@@ -666,15 +759,15 @@ class BaseServer(object):
                 self.current_index = 0
         return self.cmd_play(conn)
 
-    def cmd_pause(self, conn, state=None):
+    def cmd_pause(self, conn: MPDConnection, state: str | None = None) -> None:
         """Set the pause state playback."""
         if state is None:
             self.paused = not self.paused  # Toggle.
         else:
-            self.paused = cast_arg('intbool', state)
-        self._send_event('player')
+            self.paused = cast_arg("intbool", state)
+        self._send_event("player")
 
-    def cmd_play(self, conn, index=-1):
+    def cmd_play(self, conn: MPDConnection | None, index: int = -1) -> None:
         """Begin playback, possibly at a specified playlist index."""
         index = cast_arg(int, index)
 
@@ -692,304 +785,321 @@ class BaseServer(object):
             self.current_index = index
 
         self.paused = False
-        self._send_event('player')
+        self._send_event("player")
+        return None
 
-    def cmd_playid(self, conn, track_id=0):
+    def cmd_playid(self, conn: MPDConnection, track_id: int = 0) -> None:
         track_id = cast_arg(int, track_id)
-        if track_id == -1:
-            index = -1
-        else:
-            index = self._id_to_index(track_id)
+        index = -1 if track_id == -1 else self._id_to_index(track_id)
         return self.cmd_play(conn, index)
 
-    def cmd_stop(self, conn):
+    def cmd_stop(self, conn: MPDConnection | None) -> None:
         """Stop playback."""
         self.current_index = -1
         self.paused = False
-        self._send_event('player')
+        self._send_event("player")
 
-    def cmd_seek(self, conn, index, pos):
+    def cmd_seek(self, conn: MPDConnection, index: int, pos: float) -> None:
         """Seek to a specified point in a specified song."""
         index = cast_arg(int, index)
         if index < 0 or index >= len(self.playlist):
             raise ArgumentIndexError()
         self.current_index = index
-        self._send_event('player')
+        self._send_event("player")
 
-    def cmd_seekid(self, conn, track_id, pos):
+    def cmd_seekid(
+        self, conn: MPDConnection, track_id: int, pos: float
+    ) -> None:
         index = self._id_to_index(track_id)
         return self.cmd_seek(conn, index, pos)
 
     # Additions to the MPD protocol.
 
-    def cmd_crash_TypeError(self, conn):  # noqa: N802
+    def cmd_crash(self, conn: MPDConnection) -> NoReturn:
         """Deliberately trigger a TypeError for testing purposes.
         We want to test that the server properly responds with ERROR_SYSTEM
         without crashing, and that this is not treated as ERROR_ARG (since it
         is caused by a programming error, not a protocol error).
         """
-        'a' + 2
+        raise TypeError
 
 
-class Connection(object):
-    """A connection between a client and the server.
-    """
-    def __init__(self, server, sock):
-        """Create a new connection for the accepted socket `client`.
-        """
+class Connection:
+    """A connection between a client and the server."""
+
+    def __init__(
+        self,
+        server: BaseServer,
+        reader: asyncio.streams.StreamReader,
+        writer: asyncio.streams.StreamWriter,
+    ) -> None:
+        """Create a new connection for the accepted client streams."""
         self.server = server
-        self.sock = sock
-        self.address = u'{}:{}'.format(*sock.sock.getpeername())
+        self.reader = reader
+        self.writer = writer
+        peername = writer.get_extra_info("peername")
+        self.address = ":".join(map(str, peername)) if peername else "<unknown>"
 
-    def debug(self, message, kind=' '):
-        """Log a debug message about this connection.
-        """
-        self.server._log.debug(u'{}[{}]: {}', kind, self.address, message)
+    def debug(self, message: str, kind: str = " ") -> None:
+        """Log a debug message about this connection."""
+        self.server._log.debug("{}[{.address}]: {}", kind, self, message)
 
-    def run(self):
-        pass
+    async def run(self) -> None:
+        raise NotImplementedError
 
-    def send(self, lines):
-        """Send lines, which which is either a single string or an
+    async def send(self, lines: str | Iterable[str]) -> None:
+        """Send lines, which is either a single string or an
         iterable consisting of strings, to the client. A newline is
-        added after every string. Returns a Bluelet event that sends
-        the data.
+        added after every string.
         """
-        if isinstance(lines, six.string_types):
+        if isinstance(lines, str):
             lines = [lines]
         out = NEWLINE.join(lines) + NEWLINE
-        for l in out.split(NEWLINE)[:-1]:
-            self.debug(l, kind='>')
-        if isinstance(out, six.text_type):
-            out = out.encode('utf-8')
-        return self.sock.sendall(out)
+        for line in out.split(NEWLINE)[:-1]:
+            self.debug(line, kind=">")
+        self.writer.write(out.encode("utf-8"))
+        await self.writer.drain()
 
     @classmethod
-    def handler(cls, server):
-        def _handle(sock):
-            """Creates a new `Connection` and runs it.
-            """
-            return cls(server, sock).run()
+    def handler(cls, server: BaseServer) -> Any:
+        async def _handle(
+            reader: asyncio.streams.StreamReader,
+            writer: asyncio.streams.StreamWriter,
+        ) -> None:
+            """Creates a new `Connection` and runs it."""
+            try:
+                await cls(server, reader, writer).run()
+            finally:
+                writer.close()
+                with contextlib.suppress(ConnectionError):
+                    await writer.wait_closed()
+
         return _handle
 
 
 class MPDConnection(Connection):
-    """A connection that receives commands from an MPD-compatible client.
-    """
-    def __init__(self, server, sock):
-        """Create a new connection for the accepted socket `client`.
-        """
-        super(MPDConnection, self).__init__(server, sock)
+    """A connection that receives commands from an MPD-compatible client."""
+
+    notifications: set[str]
+    idle_subscriptions: set[str]
+
+    def __init__(
+        self,
+        server: BaseServer,
+        reader: asyncio.streams.StreamReader,
+        writer: asyncio.streams.StreamWriter,
+    ) -> None:
+        """Create a new connection for the accepted socket `client`."""
+        super().__init__(server, reader, writer)
         self.authenticated = False
         self.notifications = set()
         self.idle_subscriptions = set()
 
-    def do_command(self, command):
-        """A coroutine that runs the given command and sends an
-        appropriate response."""
+    async def do_command(self, command: Command | CommandList) -> None:
+        """Run the given command and send an appropriate response."""
         try:
-            yield bluelet.call(command.run(self))
+            await command.run(self)
         except BPDError as e:
             # Send the error.
-            yield self.send(e.response())
+            await self.send(e.response())
         else:
             # Send success code.
-            yield self.send(RESP_OK)
+            await self.send(RESP_OK)
 
-    def disconnect(self):
-        """The connection has closed for any reason.
-        """
+    def disconnect(self) -> None:
+        """The connection has closed for any reason."""
         self.server.disconnect(self)
-        self.debug('disconnected', kind='*')
+        self.debug("disconnected", kind="*")
 
-    def notify(self, event):
-        """Queue up an event for sending to this client.
-        """
+    def notify(self, event: str) -> None:
+        """Queue up an event for sending to this client."""
         self.notifications.add(event)
 
-    def send_notifications(self, force_close_idle=False):
-        """Send the client any queued events now.
-        """
+    async def send_notifications(self, force_close_idle: bool = False) -> None:
+        """Send the client any queued events now."""
         pending = self.notifications.intersection(self.idle_subscriptions)
         try:
             for event in pending:
-                yield self.send(u'changed: {}'.format(event))
+                await self.send(f"changed: {event}")
             if pending or force_close_idle:
                 self.idle_subscriptions = set()
                 self.notifications = self.notifications.difference(pending)
-                yield self.send(RESP_OK)
-        except bluelet.SocketClosedError:
+                await self.send(RESP_OK)
+        except ConnectionError:
             self.disconnect()  # Client disappeared.
 
-    def run(self):
+    async def run(self) -> None:
         """Send a greeting to the client and begin processing commands
         as they arrive.
         """
-        self.debug('connected', kind='*')
+        self.debug("connected", kind="*")
         self.server.connect(self)
-        yield self.send(HELLO)
+        await self.send(HELLO)
 
         clist = None  # Initially, no command list is being constructed.
         while True:
-            line = yield self.sock.readline()
-            if not line:
+            bytes_line = await self.reader.readline()
+            if not bytes_line:
                 self.disconnect()  # Client disappeared.
                 break
-            line = line.strip()
-            if not line:
-                err = BPDError(ERROR_UNKNOWN, u'No command given')
-                yield self.send(err.response())
+            bytes_line = bytes_line.strip()
+            if not bytes_line:
+                err = BPDError(ERROR_UNKNOWN, "No command given")
+                await self.send(err.response())
                 self.disconnect()  # Client sent a blank line.
                 break
-            line = line.decode('utf8')  # MPD protocol uses UTF-8.
-            for l in line.split(NEWLINE):
-                self.debug(l, kind='<')
+            line = bytes_line.decode("utf8")  # MPD protocol uses UTF-8.
+            for line in line.split(NEWLINE):
+                self.debug(line, kind="<")
 
             if self.idle_subscriptions:
                 # The connection is in idle mode.
-                if line == u'noidle':
-                    yield bluelet.call(self.send_notifications(True))
+                if line == "noidle":
+                    await self.send_notifications(True)
                 else:
-                    err = BPDError(ERROR_UNKNOWN,
-                                   u'Got command while idle: {}'.format(line))
-                    yield self.send(err.response())
+                    err = BPDError(
+                        ERROR_UNKNOWN, f"Got command while idle: {line}"
+                    )
+                    await self.send(err.response())
+                    self.disconnect()
                     break
                 continue
-            if line == u'noidle':
+            if line == "noidle":
                 # When not in idle, this command sends no response.
                 continue
 
             if clist is not None:
                 # Command list already opened.
                 if line == CLIST_END:
-                    yield bluelet.call(self.do_command(clist))
+                    await self.do_command(clist)
                     clist = None  # Clear the command list.
-                    yield bluelet.call(self.server.dispatch_events())
+                    self.server.dispatch_events()
                 else:
                     clist.append(Command(line))
 
-            elif line == CLIST_BEGIN or line == CLIST_VERBOSE_BEGIN:
+            elif line in (CLIST_BEGIN, CLIST_VERBOSE_BEGIN):
                 # Begin a command list.
                 clist = CommandList([], line == CLIST_VERBOSE_BEGIN)
 
             else:
                 # Ordinary command.
                 try:
-                    yield bluelet.call(self.do_command(Command(line)))
-                except BPDClose:
+                    await self.do_command(Command(line))
+                except BPDCloseError:
                     # Command indicates that the conn should close.
-                    self.sock.close()
                     self.disconnect()  # Client explicitly closed.
                     return
-                except BPDIdle as e:
+                except BPDIdleError as e:
                     self.idle_subscriptions = e.subsystems
-                    self.debug('awaiting: {}'.format(' '.join(e.subsystems)),
-                               kind='z')
-                yield bluelet.call(self.server.dispatch_events())
+                    self.debug(f"awaiting: {' '.join(e.subsystems)}", kind="z")
+                self.server.dispatch_events()
 
 
 class ControlConnection(Connection):
-    """A connection used to control BPD for debugging and internal events.
-    """
-    def __init__(self, server, sock):
-        """Create a new connection for the accepted socket `client`.
-        """
-        super(ControlConnection, self).__init__(server, sock)
+    """A connection used to control BPD for debugging and internal events."""
 
-    def debug(self, message, kind=' '):
-        self.server._log.debug(u'CTRL {}[{}]: {}', kind, self.address, message)
+    def __init__(
+        self,
+        server: BaseServer,
+        reader: asyncio.streams.StreamReader,
+        writer: asyncio.streams.StreamWriter,
+    ) -> None:
+        """Create a new connection for the accepted socket `client`."""
+        super().__init__(server, reader, writer)
 
-    def run(self):
-        """Listen for control commands and delegate to `ctrl_*` methods.
-        """
-        self.debug('connected', kind='*')
+    def debug(self, message: str, kind: str = " ") -> None:
+        self.server._log.debug("CTRL {}[{.address}]: {}", kind, self, message)
+
+    async def run(self) -> None:
+        """Listen for control commands and delegate to `ctrl_*` methods."""
+        self.debug("connected", kind="*")
         while True:
-            line = yield self.sock.readline()
-            if not line:
+            bytes_line = await self.reader.readline()
+            if not bytes_line:
                 break  # Client disappeared.
-            line = line.strip()
-            if not line:
+            bytes_line = bytes_line.strip()
+            if not bytes_line:
                 break  # Client sent a blank line.
-            line = line.decode('utf8')  # Protocol uses UTF-8.
-            for l in line.split(NEWLINE):
-                self.debug(l, kind='<')
+            line = bytes_line.decode("utf8")  # Protocol uses UTF-8.
+            for line in line.split(NEWLINE):
+                self.debug(line, kind="<")
             command = Command(line)
             try:
-                func = command.delegate('ctrl_', self)
-                yield bluelet.call(func(*command.args))
+                func = command.delegate("ctrl_", self)
+                await func(*command.args)
             except (AttributeError, TypeError) as e:
-                yield self.send('ERROR: {}'.format(e.args[0]))
+                await self.send(f"ERROR: {e.args[0]}")
             except Exception:
-                yield self.send(['ERROR: server error',
-                                 traceback.format_exc().rstrip()])
+                await self.send(
+                    ["ERROR: server error", traceback.format_exc().rstrip()]
+                )
 
-    def ctrl_play_finished(self):
-        """Callback from the player signalling a song finished playing.
-        """
-        yield bluelet.call(self.server.dispatch_events())
+    async def ctrl_play_finished(self) -> None:
+        """Callback from the player signalling a song finished playing."""
+        self.server.dispatch_events()
 
-    def ctrl_profile(self):
-        """Memory profiling for debugging.
-        """
+    async def ctrl_profile(self) -> None:
+        """Memory profiling for debugging."""
         from guppy import hpy
-        heap = hpy().heap()
-        yield self.send(heap)
 
-    def ctrl_nickname(self, oldlabel, newlabel):
-        """Rename a client in the log messages.
-        """
+        heap = hpy().heap()
+        await self.send(str(heap))
+
+    async def ctrl_nickname(self, oldlabel: str, newlabel: str) -> None:
+        """Rename a client in the log messages."""
         for c in self.server.connections:
             if c.address == oldlabel:
                 c.address = newlabel
                 break
         else:
-            yield self.send(u'ERROR: no such client: {}'.format(oldlabel))
+            await self.send(f"ERROR: no such client: {oldlabel}")
 
 
-class Command(object):
-    """A command issued by the client for processing by the server.
-    """
+class Command:
+    """A command issued by the client for processing by the server."""
 
-    command_re = re.compile(r'^([^ \t]+)[ \t]*')
     arg_re = re.compile(r'"((?:\\"|[^"])+)"|([^ \t"]+)')
 
-    def __init__(self, s):
+    def __init__(self, s: str) -> None:
         """Creates a new `Command` from the given string, `s`, parsing
         the string for command name and arguments.
         """
-        command_match = self.command_re.match(s)
-        self.name = command_match.group(1)
+        try:
+            self.name, args = s.split(maxsplit=1)
+        except ValueError:
+            self.name = s
+            args = ""
 
         self.args = []
-        arg_matches = self.arg_re.findall(s[command_match.end():])
+        arg_matches = self.arg_re.findall(args)
         for match in arg_matches:
             if match[0]:
                 # Quoted argument.
                 arg = match[0]
-                arg = arg.replace(u'\\"', u'"').replace(u'\\\\', u'\\')
+                arg = arg.replace('\\"', '"').replace("\\\\", "\\")
             else:
                 # Unquoted argument.
                 arg = match[1]
             self.args.append(arg)
 
-    def delegate(self, prefix, target, extra_args=0):
+    def delegate(
+        self,
+        prefix: str,
+        target: ControlConnection | BaseServer,
+        extra_args: int = 0,
+    ) -> Any:
         """Get the target method that corresponds to this command.
         The `prefix` is prepended to the command name and then the resulting
         name is used to search `target` for a method with a compatible number
         of arguments.
         """
         # Attempt to get correct command function.
-        func_name = prefix + self.name
+        func_name = f"{prefix}{self.name}"
         if not hasattr(target, func_name):
-            raise AttributeError(u'unknown command "{}"'.format(self.name))
+            raise AttributeError(f'unknown command "{self.name}"')
         func = getattr(target, func_name)
 
-        if six.PY2:
-            # caution: the fields of the namedtuple are slightly different
-            # between the results of getargspec and getfullargspec.
-            argspec = inspect.getargspec(func)
-        else:
-            argspec = inspect.getfullargspec(func)
+        argspec = inspect.getfullargspec(func)
 
         # Check that `func` is able to handle the number of arguments sent
         # by the client (so we can raise ERROR_ARG instead of ERROR_SYSTEM).
@@ -1002,63 +1112,66 @@ class Command(object):
         wrong_num = (len(self.args) > max_args) or (len(self.args) < min_args)
         # If the command accepts a variable number of arguments skip the check.
         if wrong_num and not argspec.varargs:
-            raise TypeError(u'wrong number of arguments for "{}"'
-                            .format(self.name), self.name)
+            raise TypeError(
+                f'wrong number of arguments for "{self.name}"', self.name
+            )
 
         return func
 
-    def run(self, conn):
-        """A coroutine that executes the command on the given
-        connection.
-        """
+    async def run(self, conn: MPDConnection) -> None:
+        """Execute the command on the given connection."""
         try:
             # `conn` is an extra argument to all cmd handlers.
-            func = self.delegate('cmd_', conn.server, extra_args=1)
+            func = self.delegate("cmd_", conn.server, extra_args=1)
         except AttributeError as e:
             raise BPDError(ERROR_UNKNOWN, e.args[0])
         except TypeError as e:
             raise BPDError(ERROR_ARG, e.args[0], self.name)
 
         # Ensure we have permission for this command.
-        if conn.server.password and \
-                not conn.authenticated and \
-                self.name not in SAFE_COMMANDS:
-            raise BPDError(ERROR_PERMISSION, u'insufficient privileges')
+        if (
+            conn.server.password
+            and not conn.authenticated
+            and self.name not in SAFE_COMMANDS
+        ):
+            raise BPDError(ERROR_PERMISSION, "insufficient privileges")
 
         try:
-            args = [conn] + self.args
+            args = [conn, *self.args]
             results = func(*args)
             if results:
                 for data in results:
-                    yield conn.send(data)
+                    await conn.send(data)
 
         except BPDError as e:
             # An exposed error. Set the command name and then let
             # the Connection handle it.
             e.cmd_name = self.name
-            raise e
+            raise
 
-        except BPDClose:
+        except BPDCloseError:
             # An indication that the connection should close. Send
             # it on the Connection.
             raise
 
-        except BPDIdle:
+        except BPDIdleError:
             raise
 
         except Exception:
             # An "unintentional" error. Hide it from the client.
-            conn.server._log.error('{}', traceback.format_exc())
-            raise BPDError(ERROR_SYSTEM, u'server error', self.name)
+            conn.server._log.error("{}", traceback.format_exc())
+            raise BPDError(ERROR_SYSTEM, "server error", self.name)
 
 
-class CommandList(list):
+class CommandList(list[Command]):
     """A list of commands issued by the client for processing by the
     server. May be verbose, in which case the response is delimited, or
     not. Should be a list of `Command` objects.
     """
 
-    def __init__(self, sequence=None, verbose=False):
+    def __init__(
+        self, sequence: Iterable[Command] | None = None, verbose: bool = False
+    ) -> None:
         """Create a new `CommandList` from the given sequence of
         `Command`s. If `verbose`, this is a verbose command list.
         """
@@ -1067,123 +1180,107 @@ class CommandList(list):
                 self.append(item)
         self.verbose = verbose
 
-    def run(self, conn):
-        """Coroutine executing all the commands in this list.
-        """
+    async def run(self, conn: MPDConnection) -> None:
+        """Execute all the commands in this list."""
         for i, command in enumerate(self):
             try:
-                yield bluelet.call(command.run(conn))
+                await command.run(conn)
             except BPDError as e:
                 # If the command failed, stop executing.
                 e.index = i  # Give the error the correct index.
-                raise e
+                raise
 
             # Otherwise, possibly send the output delimiter if we're in a
             # verbose ("OK") command list.
             if self.verbose:
-                yield conn.send(RESP_CLIST_VERBOSE)
+                await conn.send(RESP_CLIST_VERBOSE)
 
 
 # A subclass of the basic, protocol-handling server that actually plays
 # music.
+
 
 class Server(BaseServer):
     """An MPD-compatible server using GStreamer to play audio and beets
     to store its library.
     """
 
-    def __init__(self, library, host, port, password, ctrl_port, log):
-        try:
-            from beetsplug.bpd import gstplayer
-        except ImportError as e:
-            # This is a little hacky, but it's the best I know for now.
-            if e.args[0].endswith(' gst'):
-                raise NoGstreamerError()
-            else:
-                raise
-        log.info(u'Starting server...')
-        super(Server, self).__init__(host, port, password, ctrl_port, log)
+    def __init__(
+        self,
+        library: Library,
+        host: str,
+        port: int,
+        password: str,
+        ctrl_port: int,
+        log: Logger,
+    ) -> None:
+        log.info("Starting server...")
+        super().__init__(host, port, password, ctrl_port, log)
         self.lib = library
         self.player = gstplayer.GstPlayer(self.play_finished)
         self.cmd_update(None)
-        log.info(u'Server ready and listening on {}:{}'.format(
-            host, port))
-        log.debug(u'Listening for control signals on {}:{}'.format(
-            host, ctrl_port))
+        log.info("Server ready and listening on {}:{}", host, port)
+        log.debug("Listening for control signals on {}:{}", host, ctrl_port)
 
-    def run(self):
+    def run(self) -> None:
         self.player.run()
-        super(Server, self).run()
+        super().run()
 
-    def play_finished(self):
-        """A callback invoked every time our player finishes a track.
-        """
+    def play_finished(self) -> None:
+        """A callback invoked every time our player finishes a track."""
         self.cmd_next(None)
-        self._ctrl_send(u'play_finished')
+        self._ctrl_send("play_finished")
 
     # Metadata helper functions.
 
-    def _item_info(self, item):
+    def _item_info(self, item: Item) -> list[str]:
         info_lines = [
-            u'file: ' + item.destination(fragment=True),
-            u'Time: ' + six.text_type(int(item.length)),
-            u'duration: ' + u'{:.3f}'.format(item.length),
-            u'Id: ' + six.text_type(item.id),
+            f"file: {vfs.item_path(item)}",
+            f"Time: {int(item.length)}",
+            "duration: {item.length:.3f}",
+            f"Id: {item.id}",
         ]
 
         try:
-            pos = self._id_to_index(item.id)
-            info_lines.append(u'Pos: ' + six.text_type(pos))
+            if item.id is not None:
+                pos = self._id_to_index(item.id)
+                info_lines.append(f"Pos: {pos}")
         except ArgumentNotFoundError:
             # Don't include position if not in playlist.
             pass
 
         for tagtype, field in self.tagtype_map.items():
-            info_lines.append(u'{}: {}'.format(
-                tagtype, six.text_type(getattr(item, field))))
+            field_value = getattr(item, field)
+            if isinstance(field_value, list):
+                field_value = "; ".join(field_value)
+            info_lines.append(f"{tagtype}: {field_value}")
 
         return info_lines
 
-    def _parse_range(self, items, accept_single_number=False):
-        """Convert a range of positions to a list of item info.
-        MPD specifies ranges as START:STOP (endpoint excluded) for some
-        commands. Sometimes a single number can be provided instead.
-        """
-        try:
-            start, stop = str(items).split(':', 1)
-        except ValueError:
-            if accept_single_number:
-                return [cast_arg(int, items)]
-            raise BPDError(ERROR_ARG, u'bad range syntax')
-        start = cast_arg(int, start)
-        stop = cast_arg(int, stop)
-        return range(start, stop)
-
-    def _item_id(self, item):
+    def _item_id(self, item: Item) -> int | None:
         return item.id
 
     # Database updating.
 
-    def cmd_update(self, conn, path=u'/'):
-        """Updates the catalog to reflect the current database state.
-        """
+    def cmd_update(self, conn: MPDConnection | None, path: str = "/") -> None:
+        """Updates the catalog to reflect the current database state."""
         # Path is ignored. Also, the real MPD does this asynchronously;
         # this is done inline.
-        self._log.debug(u'Building directory tree...')
+        self._log.debug("Building directory tree...")
         self.tree = vfs.libtree(self.lib)
-        self._log.debug(u'Finished building directory tree.')
+        self._log.debug("Finished building directory tree.")
         self.updated_time = time.time()
-        self._send_event('update')
-        self._send_event('database')
+        self._send_event("update")
+        self._send_event("database")
 
     # Path (directory tree) browsing.
 
-    def _resolve_path(self, path):
+    def _resolve_path(self, path: str) -> vfs.Node | int:
         """Returns a VFS node or an item ID located at the path given.
         If the path does not exist, raises a
         """
-        components = path.split(u'/')
-        node = self.tree
+        components = path.split("/")
+        node: Node | int = self.tree
 
         for component in components:
             if not component:
@@ -1202,191 +1299,187 @@ class Server(BaseServer):
 
         return node
 
-    def _path_join(self, p1, p2):
+    def _path_join(self, p1: str, p2: str) -> str:
         """Smashes together two BPD paths."""
-        out = p1 + u'/' + p2
-        return out.replace(u'//', u'/').replace(u'//', u'/')
+        out = f"{p1}/{p2}"
+        return out.replace("//", "/").replace("//", "/")
 
-    def cmd_lsinfo(self, conn, path=u"/"):
+    def cmd_lsinfo(self, conn: MPDConnection, path: str = "/") -> Iterator[Any]:
         """Sends info on all the items in the path."""
         node = self._resolve_path(path)
         if isinstance(node, int):
             # Trying to list a track.
-            raise BPDError(ERROR_ARG, u'this is not a directory')
-        else:
+            raise BPDError(ERROR_ARG, "this is not a directory")
+        elif node:
             for name, itemid in iter(sorted(node.files.items())):
-                item = self.lib.get_item(itemid)
-                yield self._item_info(item)
+                if item := self.lib.get_item(itemid):
+                    yield self._item_info(item)
             for name, _ in iter(sorted(node.dirs.items())):
                 dirpath = self._path_join(path, name)
-                if dirpath.startswith(u"/"):
+                if dirpath.startswith("/"):
                     # Strip leading slash (libmpc rejects this).
                     dirpath = dirpath[1:]
-                yield u'directory: %s' % dirpath
+                yield f"directory: {dirpath}"
 
-    def _listall(self, basepath, node, info=False):
+    def _listall(
+        self, basepath: str, node: vfs.Node | int | None, info: bool = False
+    ) -> Iterator[Any]:
         """Helper function for recursive listing. If info, show
         tracks' complete info; otherwise, just show items' paths.
         """
         if isinstance(node, int):
             # List a single file.
             if info:
-                item = self.lib.get_item(node)
-                yield self._item_info(item)
+                if item := self.lib.get_item(node):
+                    yield self._item_info(item)
             else:
-                yield u'file: ' + basepath
-        else:
+                yield f"file: {basepath}"
+        elif node:
             # List a directory. Recurse into both directories and files.
             for name, itemid in sorted(node.files.items()):
                 newpath = self._path_join(basepath, name)
                 # "yield from"
-                for v in self._listall(newpath, itemid, info):
-                    yield v
+                yield from self._listall(newpath, itemid, info)
             for name, subdir in sorted(node.dirs.items()):
                 newpath = self._path_join(basepath, name)
-                yield u'directory: ' + newpath
-                for v in self._listall(newpath, subdir, info):
-                    yield v
+                yield f"directory: {newpath}"
+                yield from self._listall(newpath, subdir, info)
 
-    def cmd_listall(self, conn, path=u"/"):
+    def cmd_listall(
+        self, conn: MPDConnection, path: str = "/"
+    ) -> Iterator[Any]:
         """Send the paths all items in the directory, recursively."""
         return self._listall(path, self._resolve_path(path), False)
 
-    def cmd_listallinfo(self, conn, path=u"/"):
+    def cmd_listallinfo(
+        self, conn: MPDConnection, path: str = "/"
+    ) -> Iterator[Any]:
         """Send info on all the items in the directory, recursively."""
         return self._listall(path, self._resolve_path(path), True)
 
     # Playlist manipulation.
 
-    def _all_items(self, node):
-        """Generator yielding all items under a VFS node.
-        """
+    def _all_items(self, node: vfs.Node | int | None) -> Iterator[Item]:
+        """Generator yielding all items under a VFS node."""
         if isinstance(node, int):
             # Could be more efficient if we built up all the IDs and
             # then issued a single SELECT.
-            yield self.lib.get_item(node)
-        else:
+            if item := self.lib.get_item(node):
+                yield item
+        elif node:
             # Recurse into a directory.
             for name, itemid in sorted(node.files.items()):
                 # "yield from"
-                for v in self._all_items(itemid):
-                    yield v
+                yield from self._all_items(itemid)
             for name, subdir in sorted(node.dirs.items()):
-                for v in self._all_items(subdir):
-                    yield v
+                yield from self._all_items(subdir)
 
-    def _add(self, path, send_id=False):
+    def _add(self, path: str, send_id: bool = False) -> Iterator[Any]:
         """Adds a track or directory to the playlist, specified by the
         path. If `send_id`, write each item's id to the client.
         """
         for item in self._all_items(self._resolve_path(path)):
             self.playlist.append(item)
             if send_id:
-                yield u'Id: ' + six.text_type(item.id)
+                yield f"Id: {item.id}"
         self.playlist_version += 1
-        self._send_event('playlist')
+        self._send_event("playlist")
 
-    def cmd_add(self, conn, path):
+    def cmd_add(self, conn: MPDConnection, path: str) -> Iterator[Any]:
         """Adds a track or directory to the playlist, specified by a
         path.
         """
         return self._add(path, False)
 
-    def cmd_addid(self, conn, path):
+    def cmd_addid(self, conn: MPDConnection, path: str) -> Iterator[Any]:
         """Same as `cmd_add` but sends an id back to the client."""
         return self._add(path, True)
 
     # Server info.
 
-    def cmd_status(self, conn):
-        for line in super(Server, self).cmd_status(conn):
-            yield line
+    def cmd_status(self, conn: MPDConnection) -> Iterator[Any]:
+        yield from super().cmd_status(conn)
         if self.current_index > -1:
             item = self.playlist[self.current_index]
 
             yield (
-                u'bitrate: ' + six.text_type(item.bitrate / 1000),
-                u'audio: {}:{}:{}'.format(
-                    six.text_type(item.samplerate),
-                    six.text_type(item.bitdepth),
-                    six.text_type(item.channels),
-                ),
+                f"bitrate: {item.bitrate / 1000}",
+                f"audio: {item.samplerate}:{item.bitdepth}:{item.channels}",
             )
 
             (pos, total) = self.player.time()
             yield (
-                u'time: {}:{}'.format(
-                    six.text_type(int(pos)),
-                    six.text_type(int(total)),
-                ),
-                u'elapsed: ' + u'{:.3f}'.format(pos),
-                u'duration: ' + u'{:.3f}'.format(total),
+                f"time: {int(pos)}:{int(total)}",
+                "elapsed: " + f"{pos:.3f}",
+                "duration: " + f"{total:.3f}",
             )
 
         # Also missing 'updating_db'.
 
-    def cmd_stats(self, conn):
+    def cmd_stats(self, conn: MPDConnection) -> Iterator[Any]:
         """Sends some statistics about the library."""
         with self.lib.transaction() as tx:
-            statement = 'SELECT COUNT(DISTINCT artist), ' \
-                        'COUNT(DISTINCT album), ' \
-                        'COUNT(id), ' \
-                        'SUM(length) ' \
-                        'FROM items'
+            statement = (
+                "SELECT COUNT(DISTINCT artist), "
+                "COUNT(DISTINCT album), "
+                "COUNT(id), "
+                "SUM(length) "
+                "FROM items"
+            )
             artists, albums, songs, totaltime = tx.query(statement)[0]
 
         yield (
-            u'artists: ' + six.text_type(artists),
-            u'albums: ' + six.text_type(albums),
-            u'songs: ' + six.text_type(songs),
-            u'uptime: ' + six.text_type(int(time.time() - self.startup_time)),
-            u'playtime: ' + u'0',  # Missing.
-            u'db_playtime: ' + six.text_type(int(totaltime)),
-            u'db_update: ' + six.text_type(int(self.updated_time)),
+            f"artists: {artists}",
+            f"albums: {albums}",
+            f"songs: {songs}",
+            f"uptime: {int(time.time() - self.startup_time)}",
+            "playtime: 0",  # Missing.
+            f"db_playtime: {int(totaltime)}",
+            f"db_update: {int(self.updated_time)}",
         )
 
-    def cmd_decoders(self, conn):
+    def cmd_decoders(self, conn: MPDConnection) -> Iterator[Any]:
         """Send list of supported decoders and formats."""
         decoders = self.player.get_decoders()
         for name, (mimes, exts) in decoders.items():
-            yield u'plugin: {}'.format(name)
+            yield f"plugin: {name}"
             for ext in exts:
-                yield u'suffix: {}'.format(ext)
+                yield f"suffix: {ext}"
             for mime in mimes:
-                yield u'mime_type: {}'.format(mime)
+                yield f"mime_type: {mime}"
 
     # Searching.
 
-    tagtype_map = {
-        u'Artist':          u'artist',
-        u'ArtistSort':      u'artist_sort',
-        u'Album':           u'album',
-        u'Title':           u'title',
-        u'Track':           u'track',
-        u'AlbumArtist':     u'albumartist',
-        u'AlbumArtistSort': u'albumartist_sort',
-        u'Label':           u'label',
-        u'Genre':           u'genre',
-        u'Date':            u'year',
-        u'OriginalDate':    u'original_year',
-        u'Composer':        u'composer',
-        u'Disc':            u'disc',
-        u'Comment':         u'comments',
-        u'MUSICBRAINZ_TRACKID':        u'mb_trackid',
-        u'MUSICBRAINZ_ALBUMID':        u'mb_albumid',
-        u'MUSICBRAINZ_ARTISTID':       u'mb_artistid',
-        u'MUSICBRAINZ_ALBUMARTISTID':  u'mb_albumartistid',
-        u'MUSICBRAINZ_RELEASETRACKID': u'mb_releasetrackid',
+    tagtype_map: ClassVar[dict[str, str]] = {
+        "Artist": "artist",
+        "ArtistSort": "artist_sort",
+        "Album": "album",
+        "Title": "title",
+        "Track": "track",
+        "AlbumArtist": "albumartist",
+        "AlbumArtistSort": "albumartist_sort",
+        "Label": "label",
+        "Genre": "genres",
+        "Date": "year",
+        "OriginalDate": "original_year",
+        "Composer": "composers",
+        "Disc": "disc",
+        "Comment": "comments",
+        "MUSICBRAINZ_TRACKID": "mb_trackid",
+        "MUSICBRAINZ_ALBUMID": "mb_albumid",
+        "MUSICBRAINZ_ARTISTID": "mb_artistid",
+        "MUSICBRAINZ_ALBUMARTISTID": "mb_albumartistid",
+        "MUSICBRAINZ_RELEASETRACKID": "mb_releasetrackid",
     }
 
-    def cmd_tagtypes(self, conn):
+    def cmd_tagtypes(self, conn: MPDConnection) -> Iterator[Any]:
         """Returns a list of the metadata (tag) fields available for
         searching.
         """
         for tag in self.tagtype_map:
-            yield u'tagtype: ' + tag
+            yield f"tagtype: {tag}"
 
-    def _tagtype_lookup(self, tag):
+    def _tagtype_lookup(self, tag: str) -> tuple[str, str]:
         """Uses `tagtype_map` to look up the beets column name for an
         MPD tagtype (or throw an appropriate exception). Returns both
         the canonical name of the MPD tagtype and the beets column
@@ -1396,71 +1489,80 @@ class Server(BaseServer):
             # Match case-insensitively.
             if test_tag.lower() == tag.lower():
                 return test_tag, key
-        raise BPDError(ERROR_UNKNOWN, u'no such tagtype')
+        raise BPDError(ERROR_UNKNOWN, "no such tagtype")
 
-    def _metadata_query(self, query_type, any_query_type, kv):
+    def _metadata_query(
+        self,
+        query_type: FieldQueryType,
+        kv: tuple[str, ...],
+        allow_any_query: bool = False,
+    ) -> dbcore.query.AndQuery | dbcore.query.TrueQuery:
         """Helper function returns a query object that will find items
         according to the library query type provided and the key-value
         pairs specified. The any_query_type is used for queries of
         type "any"; if None, then an error is thrown.
         """
         if kv:  # At least one key-value pair.
-            queries = []
+            queries: list[Query] = []
             # Iterate pairwise over the arguments.
             it = iter(kv)
             for tag, value in zip(it, it):
-                if tag.lower() == u'any':
-                    if any_query_type:
-                        queries.append(any_query_type(value,
-                                                      ITEM_KEYS_WRITABLE,
-                                                      query_type))
+                if tag.lower() == "any":
+                    if allow_any_query:
+                        queries.append(
+                            Item.any_writable_media_field_query(
+                                value, query_type
+                            )
+                        )
                     else:
-                        raise BPDError(ERROR_UNKNOWN, u'no such tagtype')
+                        raise BPDError(ERROR_UNKNOWN, "no such tagtype")
                 else:
                     _, key = self._tagtype_lookup(tag)
-                    queries.append(query_type(key, value))
+                    queries.append(Item.field_query(key, value, query_type))
             return dbcore.query.AndQuery(queries)
-        else:  # No key-value pairs.
-            return dbcore.query.TrueQuery()
+        # No key-value pairs.
+        return dbcore.query.TrueQuery()
 
-    def cmd_search(self, conn, *kv):
+    def cmd_search(self, conn: MPDConnection, *kv: str) -> Iterator[Any]:
         """Perform a substring match for items."""
-        query = self._metadata_query(dbcore.query.SubstringQuery,
-                                     dbcore.query.AnyFieldQuery,
-                                     kv)
+        query = self._metadata_query(
+            dbcore.query.SubstringQuery, kv, allow_any_query=True
+        )
         for item in self.lib.items(query):
             yield self._item_info(item)
 
-    def cmd_find(self, conn, *kv):
+    def cmd_find(self, conn: MPDConnection, *kv: str) -> Iterator[Any]:
         """Perform an exact match for items."""
-        query = self._metadata_query(dbcore.query.MatchQuery,
-                                     None,
-                                     kv)
+        query = self._metadata_query(dbcore.query.MatchQuery, kv)
         for item in self.lib.items(query):
             yield self._item_info(item)
 
-    def cmd_list(self, conn, show_tag, *kv):
+    def cmd_list(
+        self, conn: MPDConnection, show_tag: str, *kv: str
+    ) -> Iterator[Any]:
         """List distinct metadata values for show_tag, possibly
         filtered by matching match_tag to match_term.
         """
         show_tag_canon, show_key = self._tagtype_lookup(show_tag)
         if len(kv) == 1:
-            if show_tag_canon == 'Album':
+            if show_tag_canon == "Album":
                 # If no tag was given, assume artist. This is because MPD
                 # supports a short version of this command for fetching the
                 # albums belonging to a particular artist, and some clients
                 # rely on this behaviour (e.g. MPDroid, M.A.L.P.).
-                kv = ('Artist', kv[0])
+                kv = ("Artist", kv[0])
             else:
-                raise BPDError(ERROR_ARG, u'should be "Album" for 3 arguments')
+                raise BPDError(ERROR_ARG, 'should be "Album" for 3 arguments')
         elif len(kv) % 2 != 0:
-            raise BPDError(ERROR_ARG, u'Incorrect number of filter arguments')
-        query = self._metadata_query(dbcore.query.MatchQuery, None, kv)
+            raise BPDError(ERROR_ARG, "Incorrect number of filter arguments")
+        query = self._metadata_query(dbcore.query.MatchQuery, kv)
 
         clause, subvals = query.clause()
-        statement = 'SELECT DISTINCT ' + show_key + \
-                    ' FROM items WHERE ' + clause + \
-                    ' ORDER BY ' + show_key
+        statement = (
+            f"SELECT DISTINCT {show_key}"
+            f" FROM items WHERE {clause}"
+            f" ORDER BY {show_key}"
+        )
         self._log.debug(statement)
         with self.lib.transaction() as tx:
             rows = tx.query(statement, subvals)
@@ -1469,88 +1571,99 @@ class Server(BaseServer):
             if not row[0]:
                 # Skip any empty values of the field.
                 continue
-            yield show_tag_canon + u': ' + six.text_type(row[0])
+            yield f"{show_tag_canon}: {row[0]}"
 
-    def cmd_count(self, conn, tag, value):
+    def cmd_count(
+        self, conn: MPDConnection, tag: str, value: str
+    ) -> Iterator[Any]:
         """Returns the number and total time of songs matching the
         tag/value query.
         """
         _, key = self._tagtype_lookup(tag)
         songs = 0
         playtime = 0.0
-        for item in self.lib.items(dbcore.query.MatchQuery(key, value)):
+        for item in self.lib.items(
+            Item.field_query(key, value, dbcore.query.MatchQuery)
+        ):
             songs += 1
             playtime += item.length
-        yield u'songs: ' + six.text_type(songs)
-        yield u'playtime: ' + six.text_type(int(playtime))
+        yield f"songs: {songs}"
+        yield f"playtime: {int(playtime)}"
 
     # Persistent playlist manipulation. In MPD this is an optional feature so
     # these dummy implementations match MPD's behaviour with the feature off.
 
-    def cmd_listplaylist(self, conn, playlist):
-        raise BPDError(ERROR_NO_EXIST, u'No such playlist')
+    def cmd_listplaylist(self, conn: MPDConnection, playlist: str) -> NoReturn:
+        raise BPDError(ERROR_NO_EXIST, "No such playlist")
 
-    def cmd_listplaylistinfo(self, conn, playlist):
-        raise BPDError(ERROR_NO_EXIST, u'No such playlist')
+    def cmd_listplaylistinfo(
+        self, conn: MPDConnection, playlist: str
+    ) -> NoReturn:
+        raise BPDError(ERROR_NO_EXIST, "No such playlist")
 
-    def cmd_listplaylists(self, conn):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_listplaylists(self, conn: MPDConnection) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_load(self, conn, playlist):
-        raise BPDError(ERROR_NO_EXIST, u'Stored playlists are disabled')
+    def cmd_load(self, conn: MPDConnection, playlist: str) -> NoReturn:
+        raise BPDError(ERROR_NO_EXIST, "Stored playlists are disabled")
 
-    def cmd_playlistadd(self, conn, playlist, uri):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_playlistadd(
+        self, conn: MPDConnection, playlist: str, uri: str
+    ) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_playlistclear(self, conn, playlist):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_playlistclear(self, conn: MPDConnection, playlist: str) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_playlistdelete(self, conn, playlist, index):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_playlistdelete(
+        self, conn: MPDConnection, playlist: str, index: int
+    ) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_playlistmove(self, conn, playlist, from_index, to_index):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_playlistmove(
+        self, conn: MPDConnection, playlist: str, from_index: int, to_index: int
+    ) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_rename(self, conn, playlist, new_name):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_rename(
+        self, conn: MPDConnection, playlist: str, new_name: str
+    ) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_rm(self, conn, playlist):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_rm(self, conn: MPDConnection, playlist: str) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
-    def cmd_save(self, conn, playlist):
-        raise BPDError(ERROR_UNKNOWN, u'Stored playlists are disabled')
+    def cmd_save(self, conn: MPDConnection, playlist: str) -> NoReturn:
+        raise BPDError(ERROR_UNKNOWN, "Stored playlists are disabled")
 
     # "Outputs." Just a dummy implementation because we don't control
     # any outputs.
 
-    def cmd_outputs(self, conn):
+    def cmd_outputs(self, conn: MPDConnection) -> Iterator[Any]:
         """List the available outputs."""
-        yield (
-            u'outputid: 0',
-            u'outputname: gstreamer',
-            u'outputenabled: 1',
-        )
+        yield ("outputid: 0", "outputname: gstreamer", "outputenabled: 1")
 
-    def cmd_enableoutput(self, conn, output_id):
+    def cmd_enableoutput(self, conn: MPDConnection, output_id: int) -> None:
         output_id = cast_arg(int, output_id)
         if output_id != 0:
             raise ArgumentIndexError()
 
-    def cmd_disableoutput(self, conn, output_id):
+    def cmd_disableoutput(
+        self, conn: MPDConnection, output_id: int
+    ) -> NoReturn:
         output_id = cast_arg(int, output_id)
         if output_id == 0:
-            raise BPDError(ERROR_ARG, u'cannot disable this output')
-        else:
-            raise ArgumentIndexError()
+            raise BPDError(ERROR_ARG, "cannot disable this output")
+        raise ArgumentIndexError()
 
     # Playback control. The functions below hook into the
     # half-implementations provided by the base class. Together, they're
     # enough to implement all normal playback functionality.
 
-    def cmd_play(self, conn, index=-1):
+    def cmd_play(self, conn: MPDConnection | None, index: int = -1) -> None:
         new_index = index != -1 and index != self.current_index
         was_paused = self.paused
-        super(Server, self).cmd_play(conn, index)
+        super().cmd_play(conn, index)
 
         if self.current_index > -1:  # Not stopped.
             if was_paused and not new_index:
@@ -1559,79 +1672,85 @@ class Server(BaseServer):
             else:
                 self.player.play_file(self.playlist[self.current_index].path)
 
-    def cmd_pause(self, conn, state=None):
-        super(Server, self).cmd_pause(conn, state)
+    def cmd_pause(self, conn: MPDConnection, state: str | None = None) -> None:
+        super().cmd_pause(conn, state)
         if self.paused:
             self.player.pause()
         elif self.player.playing:
             self.player.play()
 
-    def cmd_stop(self, conn):
-        super(Server, self).cmd_stop(conn)
+    def cmd_stop(self, conn: MPDConnection | None) -> None:
+        super().cmd_stop(conn)
         self.player.stop()
 
-    def cmd_seek(self, conn, index, pos):
+    def cmd_seek(self, conn: MPDConnection, index: int, pos: float) -> None:
         """Seeks to the specified position in the specified song."""
         index = cast_arg(int, index)
         pos = cast_arg(float, pos)
-        super(Server, self).cmd_seek(conn, index, pos)
+        super().cmd_seek(conn, index, pos)
         self.player.seek(pos)
 
     # Volume control.
 
-    def cmd_setvol(self, conn, vol):
+    def cmd_setvol(self, conn: MPDConnection | None, vol: str | int) -> None:
         vol = cast_arg(int, vol)
-        super(Server, self).cmd_setvol(conn, vol)
+        super().cmd_setvol(conn, vol)
         self.player.volume = float(vol) / 100
 
 
 # Beets plugin hooks.
 
+
 class BPDPlugin(BeetsPlugin):
     """Provides the "beet bpd" command for running a music player
     server.
     """
-    def __init__(self):
-        super(BPDPlugin, self).__init__()
-        self.config.add({
-            'host': u'',
-            'port': 6600,
-            'control_port': 6601,
-            'password': u'',
-            'volume': VOLUME_MAX,
-        })
-        self.config['password'].redact = True
 
-    def start_bpd(self, lib, host, port, password, volume, ctrl_port):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.add(
+            {
+                "host": "",
+                "port": 6600,
+                "control_port": 6601,
+                "password": "",
+                "volume": VOLUME_MAX,
+            }
+        )
+        self.config["password"].redact = True
+
+    def start_bpd(
+        self,
+        lib: Library,
+        host: str,
+        port: int,
+        password: str,
+        volume: int,
+        ctrl_port: int,
+    ) -> None:
         """Starts a BPD server."""
-        try:
-            server = Server(lib, host, port, password, ctrl_port, self._log)
-            server.cmd_setvol(None, volume)
-            server.run()
-        except NoGstreamerError:
-            self._log.error(u'Gstreamer Python bindings not found.')
-            self._log.error(u'Install "gstreamer1.0" and "python-gi"'
-                            u'or similar package to use BPD.')
+        server = Server(lib, host, port, password, ctrl_port, self._log)
+        server.cmd_setvol(None, volume)
+        server.run()
 
-    def commands(self):
+    def commands(self) -> list[beets.ui.Subcommand]:
         cmd = beets.ui.Subcommand(
-            'bpd', help=u'run an MPD-compatible music player server'
+            "bpd", help="run an MPD-compatible music player server"
         )
 
-        def func(lib, opts, args):
-            host = self.config['host'].as_str()
+        def func(lib: Library, opts: optparse.Values, args: list[str]) -> None:
+            host = self.config["host"].as_str()
             host = args.pop(0) if args else host
-            port = args.pop(0) if args else self.config['port'].get(int)
+            port = args.pop(0) if args else self.config["port"].get(int)
             if args:
-                ctrl_port = args.pop(0)
+                ctrl_port = int(args.pop(0))
             else:
-                ctrl_port = self.config['control_port'].get(int)
+                ctrl_port = self.config["control_port"].get(int)
             if args:
-                raise beets.ui.UserError(u'too many arguments')
-            password = self.config['password'].as_str()
-            volume = self.config['volume'].get(int)
-            self.start_bpd(lib, host, int(port), password, volume,
-                           int(ctrl_port))
+                raise UserError("too many arguments")
+            password = self.config["password"].as_str()
+            volume = self.config["volume"].get(int)
+            self.start_bpd(lib, host, int(port), password, volume, ctrl_port)
 
         cmd.func = func
         return [cmd]

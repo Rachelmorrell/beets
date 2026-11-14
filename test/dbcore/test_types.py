@@ -1,0 +1,84 @@
+import time
+
+import pytest
+
+from beets.dbcore import types
+from beets.util import normpath
+
+
+def test_datetype(config):
+    t = types.DATE
+
+    # format
+    time_format = config["time_format"].as_str()
+    time_local = time.strftime(time_format, time.localtime(123456789))
+    assert time_local == t.format(123456789)
+    # parse
+    assert t.parse(time_local) == 123456789.0
+    assert t.parse("123456789.0") == 123456789.0
+    assert t.null == t.parse("not123456789.0")
+    assert t.null == t.parse("1973-11-29")
+
+
+def test_pathtype():
+    t = types.PathType()
+
+    # format
+    assert t.format("/tmp") == "/tmp"
+    assert t.format("/tmp/\u00e4lbum") == "/tmp/\xe4lbum"
+    # parse
+    assert normpath(b"/tmp") == t.parse("/tmp")
+    assert normpath(b"/tmp/\xc3\xa4lbum") == t.parse("/tmp/\u00e4lbum/")
+
+
+def test_musicalkey():
+    t = types.MusicalKey()
+
+    # parse
+    assert t.parse("c#m") == "C#m"
+    assert t.parse("g   minor") == "Gm"
+    assert t.parse("not C#m") == "Not c#m"
+
+
+def test_durationtype(config):
+    t = types.DurationType()
+
+    # format
+    assert t.format(61.23) == "1:01"
+    assert t.format(3601.23) == "60:01"
+    assert t.format(None) == "0:00"
+    # parse
+    assert t.parse("1:01") == 61.0
+    assert t.parse("61.23") == 61.23
+    assert t.parse("60:01") == 3601.0
+    assert t.null == t.parse("1:00:01")
+    assert t.null == t.parse("not61.23")
+    # config format_raw_length
+    config["format_raw_length"] = True
+    assert t.format(61.23) == "61.23"
+    assert t.format(3601.23) == "3601.23"
+
+
+@pytest.mark.parametrize(
+    "original, expected",
+    [
+        # single element with embedded "; " is expanded
+        (["Jazz; Folk; Soul"], ["Jazz", "Folk", "Soul"]),
+        # already-correct list passes through unchanged
+        (["Jazz", "Folk"], ["Jazz", "Folk"]),
+        # mixed: only the delimited element is expanded
+        (["Jazz; Folk", "Soul"], ["Jazz", "Folk", "Soul"]),
+        # None -> null (empty list)
+        (None, []),
+        # no false split: value without "; " is unchanged
+        (["Smith, John"], ["Smith, John"]),
+        # plain string gets wrapped (not split into characters)
+        ("Charli XCX", ["Charli XCX"]),
+        # string with delimiter gets split
+        ("Jazz; Folk; Soul", ["Jazz", "Folk", "Soul"]),
+        # empty string
+        ("", []),
+    ],
+)
+def test_delimitedstring_normalize(original, expected):
+    assert types.MULTI_VALUE_DSV.normalize(original) == expected

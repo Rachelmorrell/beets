@@ -1,5 +1,5 @@
 Scrub Plugin
-=============
+============
 
 The ``scrub`` plugin lets you remove extraneous metadata from files' tags. If
 you'd prefer never to see crufty tags that come from other tools, the plugin can
@@ -10,11 +10,17 @@ also provides a command that lets you manually remove files' tags.
 Automatic Scrubbing
 -------------------
 
-To automatically remove files' tags before writing new ones, just
-enable the ``scrub`` plugin (see :ref:`using-plugins`). When importing new files (with
-``import.write`` turned on) or modifying files' tags with the ``beet modify``
-command, beets will first strip all types of tags entirely and then write the
-database-tracked metadata to the file.
+To automatically remove files' tags before writing new ones, enable ``scrub``
+plugin in your configuration (see :ref:`using-plugins`) and install ``beets``
+with ``scrub`` extra
+
+.. code-block:: bash
+
+    pip install "beets[scrub]"
+
+When importing new files (with ``import.write`` turned on) or modifying files'
+tags with the ``beet modify`` command, beets will first strip all types of tags
+entirely and then write the database-tracked metadata to the file.
 
 This behavior can be disabled with the ``auto`` config option (see below).
 
@@ -34,8 +40,7 @@ whatsoever.
 Configuration
 -------------
 
-To configure the plugin, make a ``scrub:`` section in your
-configuration file. There is one option:
+To configure the plugin, make a ``scrub:`` section in your configuration file.
+There is one option:
 
-- **auto**: Enable metadata stripping during import.
-  Default: ``yes``.
+- **auto**: Enable metadata stripping during import. Default: ``yes``.

@@ -1,60 +1,63 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2019, Joris Jensen
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """
 List all files in the library folder which are not listed in the
  beets library database, including art files
 """
 
-from __future__ import absolute_import, division, print_function
-import os
+from __future__ import annotations
 
-from beets import util
+import os
+from pathlib import Path
+from typing import TYPE_CHECKING
+
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand, print_
 
-__author__ = 'https://github.com/MrNuggelz'
+if TYPE_CHECKING:
+    import optparse
+
+    from beets.library import Library
+
+
+__author__ = "https://github.com/MrNuggelz"
 
 
 class Unimported(BeetsPlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.add({"ignore_extensions": [], "ignore_subdirectories": []})
 
-    def __init__(self):
-        super(Unimported, self).__init__()
-        self.config.add(
-            {
-                'ignore_extensions': []
+    def commands(self) -> list[Subcommand]:
+        def print_unimported(
+            lib: Library, opts: optparse.Values, args: list[str]
+        ) -> None:
+            ignore_exts = tuple(
+                f".{x.lower()}"
+                for x in self.config["ignore_extensions"].as_str_seq()
+            )
+            ignore_dirs = {
+                lib.directory / x
+                for x in self.config["ignore_subdirectories"].as_str_seq()
             }
-        )
 
-    def commands(self):
-        def print_unimported(lib, opts, args):
-            ignore_exts = [('.' + x).encode() for x
-                           in self.config['ignore_extensions'].as_str_seq()]
-            in_folder = set(
-                (os.path.join(r, file) for r, d, f in os.walk(lib.directory)
-                 for file in f if not any(
-                    [file.endswith(extension) for extension in
-                     ignore_exts])))
-            in_library = set(x.path for x in lib.items())
-            art_files = set(x.artpath for x in lib.albums())
-            for f in in_folder - in_library - art_files:
-                print_(util.displayable_path(f))
+            ignored: set[Path | None] = set()
+            ignored.update(x.filepath for x in lib.items())
+            ignored.update(x.art_filepath for x in lib.albums())
+            for root, _, files in os.walk(lib.directory):
+                root_path = Path(root)
+                # do not traverse if root is a child of an ignored directory
+                if {*root_path.parents, root_path} & ignore_dirs:
+                    continue
+                for file in map(Path, files):
+                    # ignore files with ignored extensions
+                    if file.name.lower().endswith(ignore_exts):
+                        continue
+                    if (_path := root_path / file) not in ignored:
+                        print_(str(_path))
 
         unimported = Subcommand(
-            'unimported',
-            help='list all files in the library folder which are not listed'
-                 ' in the beets library database')
+            "unimported",
+            help="list all files in the library folder which are not listed"
+            " in the beets library database",
+        )
         unimported.func = print_unimported
         return [unimported]

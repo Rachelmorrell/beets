@@ -9,6 +9,7 @@
     - cape jazz
     - chimurenga
     - coupé-décalé
+    - egyptian
     - fuji music
     - genge
     - highlife
@@ -35,6 +36,7 @@
     - sega
     - seggae
     - semba
+    - shangaan electro
     - soukous
     - taarab
     - zouglou
@@ -133,6 +135,7 @@
     - chutney
     - chutney soca
     - compas
+    - folklore argentino
     - mambo
     - merengue
     - méringue
@@ -185,6 +188,7 @@
     - humor
     - parody music
     - stand-up
+    - kabarett
 - country:
     - alternative country:
         - cowpunk
@@ -250,10 +254,10 @@
         - acid breaks
         - baltimore club
         - big beat
-        - breakbeat hardcore
         - broken beat
         - florida breaks
         - nu skool breaks
+        - breaks
     - chiptune:
         - bitpop
         - game boy music
@@ -263,14 +267,14 @@
     - disco:
         - cosmic disco
         - disco polo
-            - euro disco
+        - euro disco
         - italo disco
-        - nu-disco
+        - nu disco
         - space disco
     - downtempo:
         - acid jazz
         - balearic beat
-        - chill out
+        - chillout
         - dub music
         - dubtronica
         - ethnic electronica
@@ -287,12 +291,15 @@
         - jump-up
         - liquid funk
         - neurofunk
-        - oldschool jungle:
+        - jungle:
             - darkside jungle
             - ragga jungle
+            - old school jungle
         - raggacore
         - sambass
         - techstep
+        - leftfield
+        - halftime
     - electro:
         - crunk
         - electro backbeat
@@ -321,7 +328,7 @@
         - indietronica
         - new rave
         - space rock
-        - synthpop
+        - synth-pop
         - synthpunk
     - electronica:
         - berlin school
@@ -343,6 +350,7 @@
     - hardcore:
         - bouncy house
         - bouncy techno
+        - breakbeat hardcore
         - breakcore
         - digital hardcore
         - doomcore
@@ -351,6 +359,7 @@
         - happy hardcore
         - hardstyle
         - jumpstyle
+        - old school hardcore
         - makina
         - speedcore
         - terrorcore
@@ -400,6 +409,8 @@
             - power electronics
             - power noise
         - witch house
+    - juke:
+        - footwork
     - post-disco:
         - boogie
         - dance-pop
@@ -414,8 +425,10 @@
     - techno:
         - acid techno
         - detroit techno
+        - dub techno
         - free tekno
         - ghettotech
+        - industrial techno
         - minimal
         - nortec
         - schranz
@@ -427,9 +440,10 @@
         - acid trance
         - classic trance
         - dream trance
-        - goa trance:
+        - psytrance:
             - dark psytrance
             - full on
+            - goa trance
             - psybreaks
             - psyprog
             - suomisaundi
@@ -469,7 +483,6 @@
     - chap hop
     - christian hip hop
     - conscious hip hop
-    - country-rap
     - crunkcore
     - cumbia rap
     - east coast hip hop:
@@ -481,9 +494,10 @@
     - freestyle rap
     - g-funk
     - gangsta rap
+    - glitch hop
     - golden age hip hop
+    - hardcore hip hop
     - hip hop soul
-    - hip pop
     - hyphy
     - industrial hip hop
     - instrumental hip hop
@@ -521,11 +535,14 @@
     - west coast hip hop:
         - chicano rap
         - jerkin'
+    - austrian hip hop
+    - german hip hop
 - jazz:
     - asian american jazz
     - avant-garde jazz
     - bebop
     - boogie-woogie
+    - brass band
     - british dance band
     - chamber jazz
     - continental jazz
@@ -568,14 +585,13 @@
     - vocal jazz
     - west coast gypsy jazz
     - west coast jazz
-- other:
-    - worldbeat
+- kids music:
+    - kinderlieder
 - pop:
     - adult contemporary
     - arab pop
     - baroque pop
     - bubblegum pop
-    - chanson
     - christian pop
     - classical crossover
     - europop:
@@ -608,11 +624,13 @@
     - turkish pop
     - vispop
     - wonky pop
-- rhythm and blues:
+- r&b:
     - funk:
         - deep funk
         - go-go
         - p-funk
+        - synth funk:
+            - minneapolis sound
     - soul:
         - blue-eyed soul
         - neo soul
@@ -640,6 +658,7 @@
     - beat music
     - chinese rock
     - christian rock
+    - classic rock
     - dark cabaret
     - desert rock
     - experimental rock
@@ -657,6 +676,7 @@
             - death/doom
             - goregrind
             - melodic death metal
+            - old school death metal
             - technical death metal
         - doom metal:
             - epic doom metal
@@ -695,6 +715,7 @@
         - traditional heavy metal
     - math rock
     - new wave:
+        - synthwave
         - world fusion
     - paisley underground
     - pop rock
@@ -720,6 +741,7 @@
         - art punk
         - christian punk
         - deathrock
+        - deutschpunk
         - folk punk:
             - celtic punk
             - gypsy punk
@@ -762,5 +784,18 @@
     - dancehall
     - ska:
         - 2 tone
-        - dub
         - rocksteady
+    - dub
+- soundtrack:
+- singer-songwriter:
+    - cantautorato
+    - cantautor
+    - cantautora
+    - chanson
+    - canción de autor
+    - nueva canción
+- world music:
+    - world dub
+    - world fusion
+    - worldbeat
+

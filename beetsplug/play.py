@@ -1,107 +1,160 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, David Hamp-Gonsalves
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
+"""Send the results of a query to the configured music player as a playlist."""
 
-"""Send the results of a query to the configured music player as a playlist.
-"""
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
 
+import os
+import random
+import shlex
+import subprocess
+from os.path import relpath
+from typing import TYPE_CHECKING, Protocol
+
+from beets import config, ui, util
+from beets.exceptions import UserError
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand
-from beets.ui.commands import PromptChoice
-from beets import config
-from beets import ui
-from beets import util
-from os.path import relpath
-from tempfile import NamedTemporaryFile
-import subprocess
+from beets.util import PromptChoice, get_temp_filename
+from beets.util.color import colorize
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+    from beets.importer import ImportSession, ImportTask
+    from beets.library import LibModel, Library
+    from beets.logging import BeetsLogger as Logger
+
 
 # Indicate where arguments should be inserted into the command string.
 # If this is missing, they're placed at the end.
-ARGS_MARKER = '$args'
+ARGS_MARKER = "$args"
 
 
-def play(command_str, selection, paths, open_args, log, item_type='track',
-         keep_open=False):
+class PlayCLIOpts(Protocol):
+    album: bool
+    args: str | None
+    limit: int | None
+    randomize: bool | None
+    yes: bool | None
+
+
+# Indicate where the playlist file (with absolute path) should be inserted into
+# the command string. If this is missing, its placed at the end, but before
+# arguments.
+PLS_MARKER = "$playlist"
+
+
+def play(
+    command_str: str,
+    selection: Sequence[LibModel],
+    paths: Sequence[bytes],
+    open_args: Sequence[bytes],
+    log: Logger,
+    item_type: str = "track",
+    keep_open: bool = False,
+) -> None:
     """Play items in paths with command_str and optional arguments. If
     keep_open, return to beets, otherwise exit once command runs.
     """
     # Print number of tracks or albums to be played, log command to be run.
-    item_type += 's' if len(selection) > 1 else ''
-    ui.print_(u'Playing {0} {1}.'.format(len(selection), item_type))
-    log.debug(u'executing command: {} {!r}', command_str, open_args)
+    item_type += "s" if len(selection) > 1 else ""
+    ui.print_(f"Playing {len(selection)} {item_type}.")
+    log.debug("executing command: {} {!r}", command_str, open_args)
 
     try:
         if keep_open:
-            command = util.shlex_split(command_str)
-            command = command + open_args
-            subprocess.call(command)
+            subprocess.call([*shlex.split(command_str), *open_args])
         else:
             util.interactive_open(open_args, command_str)
     except OSError as exc:
-        raise ui.UserError(
-            "Could not play the query: {0}".format(exc))
+        raise UserError(f"Could not play the query: {exc}")
 
 
 class PlayPlugin(BeetsPlugin):
+    def __init__(self) -> None:
+        super().__init__()
 
-    def __init__(self):
-        super(PlayPlugin, self).__init__()
+        config["play"].add(
+            {
+                "command": None,
+                "use_folders": False,
+                "relative_to": None,
+                "raw": False,
+                "warning_threshold": 100,
+                "bom": False,
+            }
+        )
 
-        config['play'].add({
-            'command': None,
-            'use_folders': False,
-            'relative_to': None,
-            'raw': False,
-            'warning_threshold': 100,
-            'bom': False,
-        })
+        self.register_listener(
+            "before_choose_candidate", self.before_choose_candidate_listener
+        )
 
-        self.register_listener('before_choose_candidate',
-                               self.before_choose_candidate_listener)
-
-    def commands(self):
+    def commands(self) -> list[Subcommand]:
         play_command = Subcommand(
-            'play',
-            help=u'send music to a player as a playlist'
+            "play", help="send music to a player as a playlist"
         )
         play_command.parser.add_album_option()
         play_command.parser.add_option(
-            u'-A', u'--args',
-            action='store',
-            help=u'add additional arguments to the command',
+            "-A",
+            "--args",
+            action="store",
+            help="add additional arguments to the command",
         )
         play_command.parser.add_option(
-            u'-y', u'--yes',
+            "-R",
+            "--randomize",
             action="store_true",
-            help=u'skip the warning threshold',
+            help="randomize the order of playlist entries",
         )
+        play_command.parser.add_option(
+            "-y",
+            "--yes",
+            action="store_true",
+            help="skip the warning threshold",
+        )
+        play_command.parser.add_limit_option()
         play_command.func = self._play_command
         return [play_command]
 
-    def _play_command(self, lib, opts, args):
+    def _make_relative(self, paths: list[bytes], start: bytes) -> list[bytes]:
+        """Make each of the paths relative to the given starting point.
+
+        A path that has no relative form - on Windows, one that lives on
+        another drive - is kept absolute so that playback still works.
+        """
+        relative, absolute = [], []
+        for path in paths:
+            try:
+                relative.append(relpath(path, start))
+            except ValueError:
+                absolute.append(path)
+                relative.append(path)
+
+        if absolute:
+            self._log.warning(
+                "{} path(s) have no relative form from relative_to '{}' and "
+                "stay absolute, starting with '{}'",
+                len(absolute),
+                util.displayable_path(start),
+                util.displayable_path(absolute[0]),
+            )
+
+        return relative
+
+    def _play_command(
+        self, lib: Library, opts: PlayCLIOpts, args: list[str]
+    ) -> None:
         """The CLI command function for `beet play`. Create a list of paths
         from query, determine if tracks or albums are to be played.
         """
-        use_folders = config['play']['use_folders'].get(bool)
-        relative_to = config['play']['relative_to'].get()
+        use_folders = config["play"]["use_folders"].get(bool)
+        relative_to = config["play"]["relative_to"].get()
         if relative_to:
             relative_to = util.normpath(relative_to)
         # Perform search by album and add folders rather than tracks to
         # playlist.
+        selection: Sequence[LibModel]
         if opts.album:
-            selection = lib.albums(ui.decargs(args))
+            selection = lib.albums(args, limit=opts.limit)
             paths = []
 
             sort = lib.get_default_album_sort()
@@ -109,102 +162,119 @@ class PlayPlugin(BeetsPlugin):
                 if use_folders:
                     paths.append(album.item_dir())
                 else:
-                    paths.extend(item.path
-                                 for item in sort.sort(album.items()))
-            item_type = 'album'
+                    paths.extend(item.path for item in sort.sort(album.items()))
+            item_type = "album"
 
         # Perform item query and add tracks to playlist.
         else:
-            selection = lib.items(ui.decargs(args))
+            selection = lib.items(args, limit=opts.limit)
             paths = [item.path for item in selection]
-            item_type = 'track'
+            item_type = "track"
 
         if relative_to:
-            paths = [relpath(path, relative_to) for path in paths]
+            paths = self._make_relative(paths, relative_to)
 
         if not selection:
-            ui.print_(ui.colorize('text_warning',
-                                  u'No {0} to play.'.format(item_type)))
+            ui.print_(colorize("text_warning", f"No {item_type} to play."))
             return
 
+        if opts.randomize:
+            random.shuffle(paths)
+
         open_args = self._playlist_or_paths(paths)
+        open_args_str = [
+            p.decode("utf-8") for p in self._playlist_or_paths(paths)
+        ]
         command_str = self._command_str(opts.args)
+
+        if PLS_MARKER in command_str:
+            if not config["play"]["raw"]:
+                command_str = command_str.replace(
+                    PLS_MARKER, "".join(open_args_str)
+                )
+                self._log.debug(
+                    "command altered by PLS_MARKER to: {}", command_str
+                )
+                open_args = []
+            else:
+                command_str = command_str.replace(PLS_MARKER, " ")
 
         # Check if the selection exceeds configured threshold. If True,
         # cancel, otherwise proceed with play command.
         if opts.yes or not self._exceeds_threshold(
-                selection, command_str, open_args, item_type):
-            play(command_str, selection, paths, open_args, self._log,
-                 item_type)
+            selection, command_str, open_args, item_type
+        ):
+            play(command_str, selection, paths, open_args, self._log, item_type)
 
-    def _command_str(self, args=None):
-        """Create a command string from the config command and optional args.
-        """
-        command_str = config['play']['command'].get()
+    def _command_str(self, args: str | None = None) -> str:
+        """Create a command string from the config command and optional args."""
+        command_str = config["play"]["command"].get()
         if not command_str:
             return util.open_anything()
         # Add optional arguments to the player command.
         if args:
             if ARGS_MARKER in command_str:
                 return command_str.replace(ARGS_MARKER, args)
-            else:
-                return u"{} {}".format(command_str, args)
-        else:
-            # Don't include the marker in the command.
-            return command_str.replace(" " + ARGS_MARKER, "")
+            return f"{command_str} {args}"
+        # Don't include the marker in the command.
+        return command_str.replace(f" {ARGS_MARKER}", "")
 
-    def _playlist_or_paths(self, paths):
-        """Return either the raw paths of items or a playlist of the items.
-        """
-        if config['play']['raw']:
+    def _playlist_or_paths(self, paths: list[bytes]) -> list[bytes]:
+        """Return either the raw paths of items or a playlist of the items."""
+        if config["play"]["raw"]:
             return paths
-        else:
-            return [self._create_tmp_playlist(paths)]
+        return [self._create_tmp_playlist(paths)]
 
-    def _exceeds_threshold(self, selection, command_str, open_args,
-                           item_type='track'):
+    def _exceeds_threshold(
+        self,
+        selection: Sequence[LibModel],
+        command_str: str,
+        open_args: Sequence[bytes],
+        item_type: str = "track",
+    ) -> bool:
         """Prompt user whether to abort if playlist exceeds threshold. If
         True, cancel playback. If False, execute play command.
         """
-        warning_threshold = config['play']['warning_threshold'].get(int)
+        warning_threshold = config["play"]["warning_threshold"].get(int)
 
         # Warn user before playing any huge playlists.
         if warning_threshold and len(selection) > warning_threshold:
             if len(selection) > 1:
-                item_type += 's'
+                item_type += "s"
 
-            ui.print_(ui.colorize(
-                'text_warning',
-                u'You are about to queue {0} {1}.'.format(
-                    len(selection), item_type)))
+            ui.print_(
+                colorize(
+                    "text_warning",
+                    f"You are about to queue {len(selection)} {item_type}.",
+                )
+            )
 
-            if ui.input_options((u'Continue', u'Abort')) == 'a':
+            if ui.input_options(("Continue", "Abort")) == "a":
                 return True
 
         return False
 
-    def _create_tmp_playlist(self, paths_list):
-        """Create a temporary .m3u file. Return the filename.
-        """
-        utf8_bom = config['play']['bom'].get(bool)
-        m3u = NamedTemporaryFile('wb', suffix='.m3u', delete=False)
+    def _create_tmp_playlist(self, paths_list: Iterable[bytes]) -> bytes:
+        """Create a temporary .m3u file. Return the filename."""
+        utf8_bom = config["play"]["bom"].get(bool)
+        filename = get_temp_filename(__name__, suffix=".m3u")
+        with filename.open("wb") as m3u:
+            if utf8_bom:
+                m3u.write(b"\xef\xbb\xbf")
 
-        if utf8_bom:
-            m3u.write(b'\xEF\xBB\xBF')
+            for item in paths_list:
+                m3u.write(item + b"\n")
 
-        for item in paths_list:
-            m3u.write(item + b'\n')
-        m3u.close()
-        return m3u.name
+        return os.fsencode(filename)
 
-    def before_choose_candidate_listener(self, session, task):
-        """Append a "Play" choice to the interactive importer prompt.
-        """
-        return [PromptChoice('y', 'plaY', self.importer_play)]
+    def before_choose_candidate_listener(
+        self, session: ImportSession, task: ImportTask
+    ) -> list[PromptChoice]:
+        """Append a "Play" choice to the interactive importer prompt."""
+        return [PromptChoice("y", "plaY", self.importer_play)]
 
-    def importer_play(self, session, task):
-        """Get items from current import task and send to play function.
-        """
+    def importer_play(self, session: ImportSession, task: ImportTask) -> None:
+        """Get items from current import task and send to play function."""
         selection = task.items
         paths = [item.path for item in selection]
 
@@ -212,5 +282,11 @@ class PlayPlugin(BeetsPlugin):
         command_str = self._command_str()
 
         if not self._exceeds_threshold(selection, command_str, open_args):
-            play(command_str, selection, paths, open_args, self._log,
-                 keep_open=True)
+            play(
+                command_str,
+                selection,
+                paths,
+                open_args,
+                self._log,
+                keep_open=True,
+            )

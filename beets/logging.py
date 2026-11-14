@@ -1,106 +1,188 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Adrian Sampson.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
+"""A drop-in replacement for the standard-library `logging` module.
 
-"""A drop-in replacement for the standard-library `logging` module that
-allows {}-style log formatting on Python 2 and 3.
-
-Provides everything the "logging" module does. The only difference is
-that when getLogger(name) instantiates a logger that logger uses
-{}-style formatting.
+Provides everything the "logging" module does. In addition, beets' logger
+(as obtained by `getLogger(name)`) supports thread-local levels, and messages
+use {}-style formatting and can interpolate keywords arguments to the logging
+calls (`debug`, `info`, etc).
 """
 
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
 
-from copy import copy
-from logging import *  # noqa
-import subprocess
+import re
 import threading
-import six
+from copy import copy
+from logging import (
+    DEBUG,
+    INFO,
+    NOTSET,
+    WARNING,
+    FileHandler,
+    Filter,
+    Formatter,
+    Handler,
+    Logger,
+    NullHandler,
+    StreamHandler,
+)
+from typing import TYPE_CHECKING, Any, TypeVar, overload
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from logging import LogRecord, RootLogger
+    from types import TracebackType
+
+    T = TypeVar("T")
+
+    # see https://github.com/python/typeshed/blob/main/stdlib/logging/__init__.pyi
+    _SysExcInfoType = (
+        tuple[type[BaseException], BaseException, TracebackType | None]
+        | tuple[None, None, None]
+    )
+    _ExcInfoType = _SysExcInfoType | BaseException | bool | None
+    _ArgsType = tuple[object, ...] | Mapping[str, object]
 
 
-def logsafe(val):
-    """Coerce a potentially "problematic" value so it can be formatted
-    in a Unicode log string.
+__all__ = [
+    "DEBUG",
+    "INFO",
+    "NOTSET",
+    "WARNING",
+    "FileHandler",
+    "Filter",
+    "Handler",
+    "Logger",
+    "NullHandler",
+    "StreamHandler",
+    "getLogger",
+]
 
-    This works around a number of pitfalls when logging objects in
-    Python 2:
-    - Logging path names, which must be byte strings, requires
-      conversion for output.
-    - Some objects, including some exceptions, will crash when you call
-      `unicode(v)` while `str(v)` works fine. CalledProcessError is an
-      example.
+# Regular expression to match:
+# - C0 control characters (0x00-0x1F) except useful whitespace (\t, \n, \r)
+# - DEL control character (0x7f)
+# - C1 control characters (0x80-0x9F)
+# Used to sanitize log messages that could disrupt terminal output
+_CONTROL_CHAR_REGEX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x80-\x9f]")
+_UNICODE_REPLACEMENT_CHARACTER = "\ufffd"
+
+
+def _logsafe(val: T) -> str | T:
+    """Coerce `bytes` to `str` to avoid crashes solely due to logging.
+
+    This is particularly relevant for bytestring paths. Much of our code
+    explicitly uses `displayable_path` for them, but better be safe and prevent
+    any crashes that are solely due to log formatting.
     """
-    # Already Unicode.
-    if isinstance(val, six.text_type):
-        return val
-
-    # Bytestring: needs decoding.
-    elif isinstance(val, bytes):
+    # Bytestring: Needs decoding to be safe for substitution in format strings.
+    if isinstance(val, bytes):
         # Blindly convert with UTF-8. Eventually, it would be nice to
         # (a) only do this for paths, if they can be given a distinct
         # type, and (b) warn the developer if they do this for other
         # bytestrings.
-        return val.decode('utf-8', 'replace')
-
-    # A "problem" object: needs a workaround.
-    elif isinstance(val, subprocess.CalledProcessError):
-        try:
-            return six.text_type(val)
-        except UnicodeDecodeError:
-            # An object with a broken __unicode__ formatter. Use __str__
-            # instead.
-            return str(val).decode('utf-8', 'replace')
+        return val.decode("utf-8", "replace")
+    if isinstance(val, str):
+        # Sanitize log messages by replacing control characters that can disrupt
+        # terminals.
+        return _CONTROL_CHAR_REGEX.sub(_UNICODE_REPLACEMENT_CHARACTER, val)
 
     # Other objects are used as-is so field access, etc., still works in
-    # the format string.
-    else:
-        return val
+    # the format string. Relies on a working __str__ implementation.
+    return val
+
+
+class LegacyFormatter(Formatter):
+    """A ``logging.Formatter`` that reproduces the pre-3.0 beets output style.
+
+    For every log record, this formatter strips the ``beets.`` prefix from
+    the logger name and prepends the remainder to the message, separated by
+    a colon.  Records from the root logger ("beets") or from loggers not
+    under the ``beets`` namespace are passed through unchanged.
+
+    Usage::
+
+        handler.setFormatter(LegacyFormatter("%(legacy_prefix)s%(message)s"))
+
+    The ``legacy_msg`` attribute is attached to the record by
+    ``LegacyFormatter.format()``, so the format string above only works
+    when this class is the active formatter.  Using it with the stdlib
+    ``logging.Formatter`` will raise ``KeyError`` / ``ValueError``.
+
+    Output examples::
+
+        "beets"                     "msg"
+        "beets.musicbrainz"         "musicbrainz: msg"
+        "beets.musicbrainz.sub"     "musicbrainz.sub: msg"
+    """
+
+    def format(self, record: LogRecord) -> str:
+        parts = record.name.split(".")
+        record.legacy_prefix = (
+            f"{'.'.join(parts[1:])}: " if len(parts) > 1 else ""
+        )
+        return super().format(record)
 
 
 class StrFormatLogger(Logger):
     """A version of `Logger` that uses `str.format`-style formatting
-    instead of %-style formatting.
+    instead of %-style formatting and supports keyword arguments.
+
+    We cannot easily get rid of this even in the Python 3 era: This custom
+    formatting supports substitution from `kwargs` into the message, which the
+    default `logging.Logger._log()` implementation does not.
+
+    Remark by @sampsyo: https://stackoverflow.com/a/24683360 might be a way to
+    achieve this with less code.
     """
 
-    class _LogMessage(object):
-        def __init__(self, msg, args, kwargs):
+    class _LogMessage:
+        def __init__(
+            self, msg: str, args: _ArgsType, kwargs: dict[str, Any]
+        ) -> None:
             self.msg = msg
             self.args = args
             self.kwargs = kwargs
 
-        def __str__(self):
-            args = [logsafe(a) for a in self.args]
-            kwargs = dict((k, logsafe(v)) for (k, v) in self.kwargs.items())
+        def __str__(self) -> str:
+            args = [_logsafe(a) for a in self.args]
+            kwargs = {k: _logsafe(v) for (k, v) in self.kwargs.items()}
             return self.msg.format(*args, **kwargs)
 
-    def _log(self, level, msg, args, exc_info=None, extra=None, **kwargs):
+    def _log(
+        self,
+        level: int,
+        msg: object,
+        args: _ArgsType,
+        exc_info: _ExcInfoType = None,
+        extra: Mapping[str, Any] | None = None,
+        stack_info: bool = False,
+        stacklevel: int = 2,
+        **kwargs,
+    ) -> None:
         """Log msg.format(*args, **kwargs)"""
-        m = self._LogMessage(msg, args, kwargs)
-        return super(StrFormatLogger, self)._log(level, m, (), exc_info, extra)
+
+        if isinstance(msg, str):
+            msg = self._LogMessage(msg, args, kwargs)
+
+        return super()._log(
+            level,
+            msg,
+            (),
+            exc_info=exc_info,
+            extra=extra,
+            stack_info=stack_info,
+            stacklevel=stacklevel,
+        )
 
 
 class ThreadLocalLevelLogger(Logger):
-    """A version of `Logger` whose level is thread-local instead of shared.
-    """
-    def __init__(self, name, level=NOTSET):
+    """A version of `Logger` whose level is thread-local instead of shared."""
+
+    def __init__(self, name: str, level: int = NOTSET) -> None:
         self._thread_level = threading.local()
         self.default_level = NOTSET
-        super(ThreadLocalLevelLogger, self).__init__(name, level)
+        super().__init__(name, level)
 
     @property
-    def level(self):
+    def level(self) -> int:
         try:
             return self._thread_level.level
         except AttributeError:
@@ -108,10 +190,10 @@ class ThreadLocalLevelLogger(Logger):
             return self.level
 
     @level.setter
-    def level(self, value):
+    def level(self, value: int) -> None:
         self._thread_level.level = value
 
-    def set_global_level(self, level):
+    def set_global_level(self, level: int) -> None:
         """Set the level on the current thread + the default value for all
         threads.
         """
@@ -120,15 +202,30 @@ class ThreadLocalLevelLogger(Logger):
 
 
 class BeetsLogger(ThreadLocalLevelLogger, StrFormatLogger):
-    pass
+    """The logger class used by beets."""
+
+    def extra_debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Log a message at DEBUG level only when verbosity level is >= 3.
+
+        Intended for high-verbosity tuning/diagnostic messages that would be too
+        noisy at normal debug level.
+        """
+        # Lazy import to avoid circular dependency (beets.__init__ -> beets.logging)
+        from beets import config
+
+        if config["verbose"].as_number() >= 3:
+            self._log(DEBUG, msg, args, **kwargs)
 
 
 my_manager = copy(Logger.manager)
 my_manager.loggerClass = BeetsLogger
 
 
-def getLogger(name=None):  # noqa
+@overload
+def getLogger(name: str) -> BeetsLogger: ...
+@overload
+def getLogger(name: None = ...) -> RootLogger: ...
+def getLogger(name: str | None = None) -> BeetsLogger | RootLogger:  # noqa: N802
     if name:
-        return my_manager.getLogger(name)
-    else:
-        return Logger.root
+        return my_manager.getLogger(name)  # type: ignore[return-value]
+    return Logger.root

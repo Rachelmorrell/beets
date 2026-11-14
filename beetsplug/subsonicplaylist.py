@@ -1,25 +1,11 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2019, Joris Jensen
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
-from __future__ import absolute_import, division, print_function
+from __future__ import annotations
 
 import random
 import string
-from xml.etree import ElementTree
 from hashlib import md5
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
+from xml.etree import ElementTree
 
 import requests
 
@@ -28,146 +14,179 @@ from beets.dbcore.query import MatchQuery
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand
 
-__author__ = 'https://github.com/MrNuggelz'
+if TYPE_CHECKING:
+    import optparse
+    from collections.abc import Collection, Sequence
+
+    from beets.library import Item, Library
+
+    from ._typing import JSONDict
 
 
-def filter_to_be_removed(items, keys):
+__author__ = "https://github.com/MrNuggelz"
+TrackKey = tuple[str, str, str]
+
+
+def filter_to_be_removed(
+    items: Sequence[Item], keys: Collection[TrackKey]
+) -> list[Item]:
     if len(items) > len(keys):
         dont_remove = []
         for artist, album, title in keys:
             for item in items:
-                if artist == item['artist'] and \
-                        album == item['album'] and \
-                        title == item['title']:
+                if (
+                    artist == item["artist"]
+                    and album == item["album"]
+                    and title == item["title"]
+                ):
                     dont_remove.append(item)
         return [item for item in items if item not in dont_remove]
-    else:
-        def to_be_removed(item):
-            for artist, album, title in keys:
-                if artist == item['artist'] and\
-                           album == item['album'] and\
-                           title == item['title']:
-                    return False
-            return True
 
-        return [item for item in items if to_be_removed(item)]
+    def to_be_removed(item: Item) -> bool:
+        for artist, album, title in keys:
+            if (
+                artist == item["artist"]
+                and album == item["album"]
+                and title == item["title"]
+            ):
+                return False
+        return True
+
+    return [item for item in items if to_be_removed(item)]
 
 
 class SubsonicPlaylistPlugin(BeetsPlugin):
-
-    def __init__(self):
-        super(SubsonicPlaylistPlugin, self).__init__()
+    def __init__(self) -> None:
+        super().__init__()
         self.config.add(
             {
-                'delete': False,
-                'playlist_ids': [],
-                'playlist_names': [],
-                'username': '',
-                'password': ''
+                "delete": False,
+                "playlist_ids": [],
+                "playlist_names": [],
+                "username": "",
+                "password": "",
             }
         )
-        self.config['password'].redact = True
+        self.config["password"].redact = True
 
-    def update_tags(self, playlist_dict, lib):
+    def update_tags(
+        self, playlist_dict: dict[TrackKey, str], lib: Library
+    ) -> None:
         with lib.transaction():
             for query, playlist_tag in playlist_dict.items():
-                query = AndQuery([MatchQuery("artist", query[0]),
-                                  MatchQuery("album", query[1]),
-                                  MatchQuery("title", query[2])])
-                items = lib.items(query)
+                and_query = AndQuery(
+                    [
+                        MatchQuery("artist", query[0]),
+                        MatchQuery("album", query[1]),
+                        MatchQuery("title", query[2]),
+                    ]
+                )
+                items = lib.items(and_query)
                 if not items:
-                    self._log.warn(u"{} | track not found ({})", playlist_tag,
-                                   query)
+                    self._log.warn(
+                        "{} | track not found ({})", playlist_tag, query
+                    )
                     continue
                 for item in items:
                     item.subsonic_playlist = playlist_tag
                     item.try_sync(write=True, move=False)
 
-    def get_playlist(self, playlist_id):
-        xml = self.send('getPlaylist', {'id': playlist_id}).text
+    def get_playlist(
+        self, playlist_id: str
+    ) -> tuple[str, list[TrackKey]] | None:
+        xml = self.send("getPlaylist", {"id": playlist_id}).text
         playlist = ElementTree.fromstring(xml)[0]
-        if playlist.attrib.get('code', '200') != '200':
-            alt_error = 'error getting playlist, but no error message found'
-            self._log.warn(playlist.attrib.get('message', alt_error))
-            return
+        if playlist.attrib.get("code", "200") != "200":
+            alt_error = "error getting playlist, but no error message found"
+            self._log.warn(playlist.attrib.get("message", alt_error))
+            return None
 
-        name = playlist.attrib.get('name', 'undefined')
-        tracks = [(t.attrib['artist'], t.attrib['album'], t.attrib['title'])
-                  for t in playlist]
+        name = playlist.attrib.get("name", "undefined")
+        tracks = [
+            (t.attrib["artist"], t.attrib["album"], t.attrib["title"])
+            for t in playlist
+        ]
         return name, tracks
 
-    def commands(self):
-        def build_playlist(lib, opts, args):
+    def commands(self) -> list[Subcommand]:
+        def build_playlist(
+            lib: Library, opts: optparse.Values, args: list[str]
+        ) -> None:
             self.config.set_args(opts)
-            ids = self.config['playlist_ids'].as_str_seq()
-            if self.config['playlist_names'].as_str_seq():
+            ids = self.config["playlist_ids"].as_str_seq()
+            if self.config["playlist_names"].as_str_seq():
                 playlists = ElementTree.fromstring(
-                    self.send('getPlaylists').text)[0]
-                if playlists.attrib.get('code', '200') != '200':
-                    alt_error = 'error getting playlists,' \
-                                ' but no error message found'
-                    self._log.warn(
-                        playlists.attrib.get('message', alt_error))
+                    self.send("getPlaylists").text
+                )[0]
+                if playlists.attrib.get("code", "200") != "200":
+                    alt_error = (
+                        "error getting playlists, but no error message found"
+                    )
+                    self._log.warn(playlists.attrib.get("message", alt_error))
                     return
-                for name in self.config['playlist_names'].as_str_seq():
+                for name in self.config["playlist_names"].as_str_seq():
                     for playlist in playlists:
-                        if name == playlist.attrib['name']:
-                            ids.append(playlist.attrib['id'])
+                        if name == playlist.attrib["name"]:
+                            ids.append(playlist.attrib["id"])
 
             playlist_dict = self.get_playlists(ids)
 
             # delete old tags
-            if self.config['delete']:
+            if self.config["delete"]:
                 existing = list(lib.items('subsonic_playlist:";"'))
                 to_be_removed = filter_to_be_removed(
-                    existing,
-                    playlist_dict.keys())
+                    existing, playlist_dict.keys()
+                )
                 for item in to_be_removed:
-                    item['subsonic_playlist'] = ''
+                    item["subsonic_playlist"] = ""
                     with lib.transaction():
                         item.try_sync(write=True, move=False)
 
             self.update_tags(playlist_dict, lib)
 
         subsonicplaylist_cmds = Subcommand(
-            'subsonicplaylist', help=u'import a subsonic playlist'
+            "subsonicplaylist", help="import a subsonic playlist"
         )
         subsonicplaylist_cmds.parser.add_option(
-            u'-d',
-            u'--delete',
-            action='store_true',
-            help=u'delete tag from items not in any playlist anymore',
+            "-d",
+            "--delete",
+            action="store_true",
+            help="delete tag from items not in any playlist anymore",
         )
         subsonicplaylist_cmds.func = build_playlist
         return [subsonicplaylist_cmds]
 
-    def generate_token(self):
-        salt = ''.join(random.choices(string.ascii_lowercase + string.digits))
-        return md5(
-            (self.config['password'].get() + salt).encode()).hexdigest(), salt
+    def generate_token(self) -> tuple[str, str]:
+        salt = "".join(random.choices(string.ascii_lowercase + string.digits))
+        return (
+            md5((self.config["password"].get() + salt).encode()).hexdigest(),
+            salt,
+        )
 
-    def send(self, endpoint, params=None):
+    def send(
+        self, endpoint: str, params: JSONDict | None = None
+    ) -> requests.Response:
         if params is None:
             params = {}
         a, b = self.generate_token()
-        params['u'] = self.config['username']
-        params['t'] = a
-        params['s'] = b
-        params['v'] = '1.12.0'
-        params['c'] = 'beets'
-        resp = requests.get('{}/rest/{}?{}'.format(
-            self.config['base_url'].get(),
-            endpoint,
-            urlencode(params))
+        params["u"] = self.config["username"]
+        params["t"] = a
+        params["s"] = b
+        params["v"] = "1.12.0"
+        params["c"] = "beets"
+        return requests.get(
+            f"{self.config['base_url'].get()}/rest/{endpoint}?{urlencode(params)}",
+            timeout=10,
         )
-        return resp
 
-    def get_playlists(self, ids):
+    def get_playlists(self, ids: Sequence[str]) -> dict[TrackKey, str]:
         output = {}
         for playlist_id in ids:
-            name, tracks = self.get_playlist(playlist_id)
-            for track in tracks:
-                if track not in output:
-                    output[track] = ';'
-                output[track] += name + ';'
+            playlist = self.get_playlist(playlist_id)
+            if playlist:
+                name, tracks = playlist
+                for track in tracks:
+                    if track not in output:
+                        output[track] = ";"
+                    output[track] += f"{name};"
         return output

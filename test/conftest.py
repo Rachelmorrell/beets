@@ -1,0 +1,283 @@
+from __future__ import annotations
+
+import inspect
+import os
+import sys
+from typing import TYPE_CHECKING
+
+import pytest
+
+import beets
+from beets import logging
+from beets.autotag import Distance
+from beets.dbcore.query import Query
+from beets.test._common import DummyIO
+from beets.test.helper import RUNNING_IN_CI, ConfigMixin, TestHelper
+from beets.test.helper import is_importable as check_import
+from beets.util import cached_classproperty
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from typing import TextIO
+
+
+def skip_marked_items(items: list[pytest.Item], marker_name: str, reason: str):
+    for item in (i for i in items if i.get_closest_marker(marker_name)):
+        test_name = item.nodeid.split("::", 1)[-1]
+        item.add_marker(pytest.mark.skip(f"{reason}: {test_name}"))
+
+
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+):
+    if os.environ.get("INTEGRATION_TEST") != "true":
+        skip_marked_items(
+            items, "integration_test", "INTEGRATION_TEST=1 required"
+        )
+
+    if os.environ.get("LYRICS_UPDATED") != "true":
+        skip_marked_items(
+            items, "on_lyrics_update", "No change in lyrics source code"
+        )
+
+    for item in items:
+        if marker := item.get_closest_marker("requires_import"):
+            force_ci = marker.kwargs.get("force_ci", True)
+            if (
+                force_ci
+                and RUNNING_IN_CI
+                # only apply this to our repository, to allow other projects to
+                # run tests without installing all dependencies
+                and os.environ.get("GITHUB_REPOSITORY", "") == "beetbox/beets"
+            ):
+                continue
+
+            modname = marker.args[0]
+            if not check_import(modname):
+                test_name = item.nodeid.split("::", 1)[-1]
+                item.add_marker(
+                    pytest.mark.skip(
+                        f"{modname!r} is not installed: {test_name}"
+                    )
+                )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "integration_test: mark a test as an integration test"
+    )
+    config.addinivalue_line(
+        "markers",
+        "on_lyrics_update: run test only when lyrics source code changes",
+    )
+    config.addinivalue_line(
+        "markers",
+        (
+            "requires_import(module, force_ci=True): run test only if module"
+            " is importable (use force_ci=False to allow CI to skip the test too)"
+        ),
+    )
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    """Generate readable test identifiers for pytest parametrized tests.
+
+    Provides custom string representations for:
+    - Query classes/instances: use class name
+    - Lambda functions: show abbreviated source
+    - Other values: use standard repr()
+    """
+    if inspect.isclass(val) and issubclass(val, Query):
+        return val.__name__
+
+    if inspect.isfunction(val) and val.__name__ == "<lambda>":
+        return inspect.getsource(val).split("lambda")[-1][:30]
+
+    return repr(val)
+
+
+def pytest_assertrepr_compare(op, left, right):
+    if isinstance(left, Distance) or isinstance(right, Distance):
+        return [f"Comparing Distance: {float(left)} {op} {float(right)}"]
+    return None
+
+
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int:
+    """Choose an xdist worker count that fits the scope of the current test run.
+
+    This keeps focused runs predictable by avoiding parallelism for a single
+    target or filtered selection, while allowing broader runs to scale either
+    from explicit overrides, the number of requested paths, or available CPU
+    capacity.
+
+    Notably, for a single test file -n0 is much faster than -n auto.
+
+    Examples:
+    `pytest -n auto tests/unit/test_service.py`
+        Disables xdist for a single targeted file.
+
+    `pytest -n auto tests/unit tests/integration`
+        Uses up to two workers because two paths were requested.
+
+    `pytest -n auto -k refund`
+        Disables xdist for a filtered run to keep feedback predictable.
+
+    `pytest -n4`
+        Use 4 workers, skipping this logic.
+    """
+    should_log = config.getoption("verbose") > 0
+
+    def log(message: str) -> None:
+        if should_log:
+            print(f"[xdist] {message}", file=sys.stderr)
+
+    # Use half of the logical CPUs available to this process.
+    #
+    # Half the logical CPUs performed best for the full Beets and
+    # DB-backed Django test suites on both 4-core Intel and 15-core M5 machines.
+    logical = (os.cpu_count() or 0) // 2
+    args: list[str]
+    if len(
+        args := (config.getoption("file_or_dir") or [])
+    ) == 1 or config.getoption("-k"):
+        log("Using single worker: '-k' option or single path provided.")
+        count = 0
+    elif args:
+        count = min(len(args), config.getoption("maxprocesses") or logical)
+        log(f"Using {count} workers for {len(args)} args")
+    else:
+        log(f"No args specified, using default ({logical}) workers")
+        return logical
+
+    return count
+
+
+class _CurrentStderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """Write CLI logs to the active standard error stream.
+
+    Logging is bootstrapped when the CLI runs instead of when this module is
+    imported. That startup can happen while callers have temporarily replaced
+    ``sys.stderr`` for capture or redirection, such as pytest's per-test capture
+    streams. The handler must not retain the stream that happened to be active
+    during the first command invocation because that stream may later be closed.
+    Resolving the stream for each record keeps logs attached to the current CLI
+    environment.
+    """
+
+    @property
+    def stream(self) -> TextIO:
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, stream: TextIO) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def patch_logging_handler(monkeypatch):
+    """Ensure that beets logs are captured by pytest's capture system."""
+    monkeypatch.setattr(
+        "beets.ui._get_logging_handler", lambda: _CurrentStderrHandler()
+    )
+
+
+@pytest.fixture(autouse=True)
+def do_not_log_sources(monkeypatch):
+    monkeypatch.setattr("beets.config.log_sources", lambda _: None)
+
+
+@pytest.fixture(autouse=True)
+def restore_log_level() -> Iterator[None]:
+    """Reset the global log level, which the CLI sets and never restores.
+
+    See https://github.com/beetbox/beets/actions/runs/38253501906/job/114825507731.
+    """
+    log = logging.getLogger("beets")
+    default_level, level = log.default_level, log.level
+    yield
+    log.default_level = default_level
+    log.setLevel(level)
+
+
+@pytest.fixture(autouse=True)
+def clear_cached_classproperty():
+    cached_classproperty.cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def unload_plugins() -> Iterator[None]:
+    """Unload plugins at the end of each test."""
+    yield
+
+    beets.plugins.BeetsPlugin.listeners.clear()
+    beets.plugins.BeetsPlugin._raw_listeners.clear()
+    beets.config["plugins"] = []
+    beets.plugins._instances.clear()
+
+
+@pytest.fixture
+def config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[beets.IncludeLazyConfig]:
+    """Provide fresh defaults and restore the previous configuration afterward."""
+    with monkeypatch.context() as patch:
+        # Preserve state that ConfigMixin resets on the shared config object.
+        patch.setattr(beets.config, "sources", [])
+        patch.setattr(beets.config, "redactions", set())
+        patch.setattr(beets.config, "_lazy_prefix", [])
+        patch.setattr(beets.config, "_lazy_suffix", [])
+        patch.setattr(beets.config, "_materialized", True)
+        yield ConfigMixin().config
+
+
+@pytest.fixture
+def io(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    capteesys: pytest.CaptureFixture[str],
+) -> DummyIO:
+    """Fixture for tests that need controllable stdin and captured stdout.
+
+    This fixture builds a per-test ``DummyIO`` helper and exposes it to the
+    test. When used on a test class, it attaches the helper as ``self.io``
+    attribute to make it available to all test methods, including
+    ``unittest.TestCase``-based ones.
+    """
+    io = DummyIO(monkeypatch, capteesys)
+
+    if request.instance:
+        request.instance.io = io
+
+    return io
+
+
+@pytest.fixture
+def is_importable():
+    """Fixture that provides a function to check if a module can be imported."""
+
+    return check_import
+
+
+# Inheriting from TestHelper gives each test function isolated state. Use the
+# fixtures below instead when a broader scope is safe and the suite benefits
+# from reusing the same helper instance.
+@pytest.fixture(scope="module")
+def module_helper():
+    """Share beets test state within one test module.
+
+    Use this when tests in the same file can reuse setup and side effects, but
+    later modules should still begin from a clean environment.
+    """
+    with TestHelper() as helper:
+        yield helper
+
+
+@pytest.fixture(scope="class")
+def class_helper():
+    """Share beets test state within one test class.
+
+    Use this when methods in a class can build on the same setup, while nearby
+    classes still need independent libraries, files, or configuration.
+    """
+    with TestHelper() as helper:
+        yield helper

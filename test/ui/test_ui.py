@@ -1,0 +1,519 @@
+"""Tests for the command-line interface."""
+
+import os
+import platform
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+from confuse import ConfigError
+
+from beets import plugins, ui
+from beets.exceptions import UserError
+from beets.test import _common
+from beets.test.helper import BeetsTestCase, IOMixin, PluginTestCase
+from beets.ui import _open_library, commands
+
+
+class PrintTest(IOMixin, unittest.TestCase):
+    def test_print_without_locale(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LANG", None)
+
+            ui.print_("something")
+
+    @patch.dict(os.environ, {"LANG": "", "LC_CTYPE": "UTF-8"}, clear=False)
+    def test_print_with_invalid_locale(self):
+        ui.print_("something")
+
+
+class ShowModelChangesTest(IOMixin, BeetsTestCase):
+    def test_uses_database_state_when_old_not_provided(self):
+        item = self.add_item_fixture(title="old title")
+        old_label = format(item.get_fresh_from_db())
+
+        item.title = "new title"
+
+        assert ui.show_model_changes(item) is True
+        assert self.io.getoutput().splitlines() == [
+            old_label,
+            "  title: old title -> new title",
+        ]
+
+
+class TestPluginTestCase(PluginTestCase):
+    plugin = "test"
+
+    def setUp(self):
+        self.config["pluginpath"] = [_common.PLUGINPATH]
+        super().setUp()
+
+
+class ConfigTest(IOMixin, TestPluginTestCase):
+    @pytest.fixture(autouse=True)
+    def disable_migration_backup(self, monkeypatch):
+        """Do not perform database backup before migration.
+
+        Our `self.config` is configured to not create backups, however, these
+        tests work with temporary config files.
+        """
+        monkeypatch.setattr(
+            "beets.dbcore.db.Migration._before_migration_backup",
+            lambda *_: None,
+        )
+
+    def setUp(self):
+        super().setUp()
+
+        # Don't use the BEETSDIR from `helper`. Instead, we point the home
+        # directory there. Some tests will set `BEETSDIR` themselves.
+        del os.environ["BEETSDIR"]
+
+        # Also set APPDATA, the Windows equivalent of setting $HOME.
+        appdata_dir = self.temp_path / "AppData" / "Roaming"
+
+        self._orig_cwd = Path.cwd()
+        self.test_cmd = self._make_test_cmd()
+        commands.default_commands.append(self.test_cmd)
+
+        # Default user configuration
+        if platform.system() == "Windows":
+            self.user_config_dir = appdata_dir / "beets"
+        else:
+            self.user_config_dir = self.temp_path / ".config" / "beets"
+        self.user_config_dir.mkdir(parents=True, exist_ok=True)
+        self.user_config_path = self.user_config_dir / "config.yaml"
+
+        # Custom BEETSDIR
+        self.beetsdir = self.temp_path / "beetsdir"
+        self.beetsdir.mkdir(parents=True, exist_ok=True)
+
+        self.env_config_path = self.beetsdir / "config.yaml"
+        self.cli_config_path = self.temp_path / "config.yaml"
+        self.env_patcher = patch(
+            "os.environ",
+            {
+                "HOME": str(self.temp_path),
+                # Windows' ntpath.expanduser ignores $HOME: it reads USERPROFILE.
+                "USERPROFILE": str(self.temp_path),
+                "APPDATA": str(appdata_dir),
+            },
+        )
+        self.env_patcher.start()
+
+        self._reset_config()
+
+    def run_command(self, *args, **kwargs):
+        # We need to reload the lib based on the
+        # current config
+        self.lib = _open_library(self.config)
+        super().run_command(*args, **kwargs)
+
+    def tearDown(self):
+        self.env_patcher.stop()
+        commands.default_commands.pop()
+        os.chdir(self._orig_cwd)
+        # A failed read leaves the shared config materialized but empty, which
+        # breaks every later test that reads it. Undo that for the next test.
+        self._reset_config()
+        super().tearDown()
+
+    def _make_test_cmd(self):
+        test_cmd = ui.Subcommand("test", help="test")
+
+        def run(lib, options, args):
+            test_cmd.lib = lib
+            test_cmd.options = options
+            test_cmd.args = args
+
+        test_cmd.func = run
+        return test_cmd
+
+    def _reset_config(self):
+        # Config should read files again on demand
+        self.config.clear()
+        self.config._materialized = False
+
+    def test_paths_section_respected(self):
+        self.user_config_path.write_text("paths: {x: y}")
+
+        self.run_command("test")
+        assert self.test_cmd.lib.path_formats[0] == ("x", "y")
+
+    def test_nonexistant_db(self):
+        self.user_config_path.write_text("library: /xxx/yyy/not/a/real/path")
+
+        self.io.addinput("n")
+        with pytest.raises(UserError):
+            self.run_command("test")
+
+    def test_user_config_file(self):
+        self.user_config_path.write_text("anoption: value")
+
+        self.run_command("test")
+        assert self.config["anoption"].get() == "value"
+
+    def test_replacements_parsed(self):
+        self.user_config_path.write_text("replace: {'[xy]': z}")
+
+        self.run_command("test")
+        replacements = self.test_cmd.lib.replacements
+        repls = [(p.pattern, s) for p, s in replacements]  # Compare patterns.
+        assert repls == [("[xy]", "z")]
+
+    def test_multiple_replacements_parsed(self):
+        self.user_config_path.write_text("replace: {'[xy]': z, foo: bar}")
+        self.run_command("test")
+        replacements = self.test_cmd.lib.replacements
+        repls = [(p.pattern, s) for p, s in replacements]
+        assert repls == [("[xy]", "z"), ("foo", "bar")]
+
+    def test_cli_config_option(self):
+        self.cli_config_path.write_text("anoption: value")
+        self.run_command("--config", str(self.cli_config_path), "test")
+        assert self.config["anoption"].get() == "value"
+
+    def test_cli_config_file_overwrites_user_defaults(self):
+        self.user_config_path.write_text("anoption: value")
+
+        self.cli_config_path.write_text("anoption: cli overwrite")
+        self.run_command("--config", str(self.cli_config_path), "test")
+        assert self.config["anoption"].get() == "cli overwrite"
+
+    def test_cli_config_file_overwrites_beetsdir_defaults(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+        self.env_config_path.write_text("anoption: value")
+
+        self.cli_config_path.write_text("anoption: cli overwrite")
+        self.run_command("--config", str(self.cli_config_path), "test")
+        assert self.config["anoption"].get() == "cli overwrite"
+
+    def test_multiple_cli_config_files(self):
+        cli_config_path_1 = self.temp_path / "config.yaml"
+        cli_config_path_2 = self.temp_path / "config_2.yaml"
+
+        cli_config_path_1.write_text("first: value")
+        cli_config_path_2.write_text("second: value")
+
+        self.run_command(
+            "--config",
+            str(cli_config_path_1),
+            "--config",
+            str(cli_config_path_2),
+            "test",
+        )
+        assert self.config["second"].get() == "value"
+        assert self.config["first"].get() == "value"
+
+    def test_multiple_cli_config_overwrite(self):
+        cli_overwrite_config_path = self.temp_path / "overwrite_config.yaml"
+
+        self.cli_config_path.write_text("anoption: value")
+
+        cli_overwrite_config_path.write_text("anoption: overwrite")
+
+        self.run_command(
+            "--config",
+            str(self.cli_config_path),
+            "--config",
+            str(cli_overwrite_config_path),
+            "test",
+        )
+        assert self.config["anoption"].get() == "overwrite"
+
+    def test_cli_config_paths_resolve_relative_to_user_dir(self):
+        self.cli_config_path.write_text("library: beets.db\nstatefile: state")
+
+        self.run_command("--config", str(self.cli_config_path), "test")
+        assert (
+            self.config["library"].as_path()
+            == self.user_config_dir / "beets.db"
+        )
+        assert (
+            self.config["statefile"].as_path() == self.user_config_dir / "state"
+        )
+
+    def test_cli_config_paths_resolve_relative_to_beetsdir(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+
+        self.cli_config_path.write_text("library: beets.db\nstatefile: state")
+
+        self.run_command("--config", str(self.cli_config_path), "test")
+        assert self.config["library"].as_path() == self.beetsdir / "beets.db"
+        assert self.config["statefile"].as_path() == self.beetsdir / "state"
+
+    def test_command_line_option_relative_to_working_dir(self):
+        self.config.read()
+        os.chdir(self.temp_path)
+        self.run_command("--library", "foo.db", "test")
+        assert self.config["library"].as_path() == Path.cwd() / "foo.db"
+
+    def test_cli_config_file_loads_plugin_commands(self):
+        self.cli_config_path.write_text(
+            f"pluginpath: {_common.PLUGINPATH}\nplugins: test"
+        )
+
+        self.run_command("--config", str(self.cli_config_path), "plugin")
+        plugs = plugins.find_plugins()
+        assert len(plugs) == 1
+        assert plugs[0].is_test_plugin
+        self.unload_plugins()
+
+    def test_beetsdir_config(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+
+        self.env_config_path.write_text("anoption: overwrite")
+
+        self.config.read()
+        assert self.config["anoption"].get() == "overwrite"
+
+    def test_beetsdir_points_to_file_error(self):
+        beetsdir = self.temp_path / "beetsfile"
+        beetsdir.touch()
+        os.environ["BEETSDIR"] = str(beetsdir)
+        with pytest.raises(ConfigError):
+            self.run_command("test")
+
+    def test_beetsdir_config_does_not_load_default_user_config(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+
+        self.user_config_path.write_text("anoption: value")
+
+        self.config.read()
+        assert not self.config["anoption"].exists()
+
+    def test_default_config_paths_resolve_relative_to_beetsdir(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+
+        self.config.read()
+        assert self.config["library"].as_path() == self.beetsdir / "library.db"
+        assert (
+            self.config["statefile"].as_path() == self.beetsdir / "state.pickle"
+        )
+
+    def test_beetsdir_config_paths_resolve_relative_to_beetsdir(self):
+        os.environ["BEETSDIR"] = str(self.beetsdir)
+
+        self.env_config_path.write_text("library: beets.db\nstatefile: state")
+
+        self.config.read()
+        assert self.config["library"].as_path() == self.beetsdir / "beets.db"
+        assert self.config["statefile"].as_path() == self.beetsdir / "state"
+
+
+class PluginTest(TestPluginTestCase):
+    def test_plugin_command_from_pluginpath(self):
+        self.run_command("test")
+
+
+class CommonOptionsParserCliTest(IOMixin, BeetsTestCase):
+    """Test CommonOptionsParser and formatting LibModel formatting on 'list'
+    command.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.item = _common.item()
+        self.item.path = b"xxx/yyy"
+        self.lib.add(self.item)
+        self.lib.add_album([self.item])
+
+    def test_base(self):
+        output = self.run_with_output("ls")
+        assert output == "the artist - the album - the title\n"
+
+        output = self.run_with_output("ls", "-a")
+        assert output == "the album artist - the album\n"
+
+    def test_path_option(self):
+        output = self.run_with_output("ls", "-p")
+        assert output == f"{self.lib_path / 'xxx/yyy'}\n"
+
+        output = self.run_with_output("ls", "-a", "-p")
+        assert output == f"{self.lib_path / 'xxx'}\n"
+
+    def test_format_option(self):
+        output = self.run_with_output("ls", "-f", "$artist")
+        assert output == "the artist\n"
+
+        output = self.run_with_output("ls", "-a", "-f", "$albumartist")
+        assert output == "the album artist\n"
+
+    def test_format_option_unicode(self):
+        output = self.run_with_output("ls", "-f", "caf\xe9")
+        assert output == "caf\xe9\n"
+
+    def test_root_format_option(self):
+        output = self.run_with_output(
+            "--format-item", "$artist", "--format-album", "foo", "ls"
+        )
+        assert output == "the artist\n"
+
+        output = self.run_with_output(
+            "--format-item", "foo", "--format-album", "$albumartist", "ls", "-a"
+        )
+        assert output == "the album artist\n"
+
+    def test_help(self):
+        output = self.run_with_output("help")
+        assert "Usage:" in output
+
+        # command description is on the same line
+        assert (
+            "config            show or edit the user configuration" in output
+        ), "unexpected command description formatting"
+
+        output = self.run_with_output("help", "list")
+        assert "Usage:" in output
+
+        with pytest.raises(UserError):
+            self.run_command("help", "this.is.not.a.real.command")
+
+    def test_stats(self):
+        output = self.run_with_output("stats")
+        assert "Approximate total size:" in output
+
+    def test_version(self):
+        output = self.run_with_output("version")
+        assert "Python version" in output
+        assert "no plugins loaded" in output
+
+
+class TestCommonOptionsParser:
+    def test_album_option(self):
+        parser = ui.CommonOptionsParser()
+        assert not parser._album_flags
+        parser.add_album_option()
+        assert bool(parser._album_flags)
+
+        assert parser.parse_args([]) == ({"album": False}, [])
+        assert parser.parse_args(["-a"]) == ({"album": True}, [])
+        assert parser.parse_args(["--album"]) == ({"album": True}, [])
+
+    def test_path_option(self, config):
+        parser = ui.CommonOptionsParser()
+        parser.add_path_option()
+        assert not parser._album_flags
+
+        config["format_item"].set("$foo")
+        assert parser.parse_args([]) == ({"path": None}, [])
+        assert config["format_item"].as_str() == "$foo"
+
+        assert parser.parse_args(["-p"]) == (
+            {"path": True, "format": "$path"},
+            [],
+        )
+        assert parser.parse_args(["--path"]) == (
+            {"path": True, "format": "$path"},
+            [],
+        )
+
+        assert config["format_item"].as_str() == "$path"
+        assert config["format_album"].as_str() == "$path"
+
+    def test_format_option(self, config):
+        parser = ui.CommonOptionsParser()
+        parser.add_format_option()
+        assert not parser._album_flags
+
+        config["format_item"].set("$foo")
+        assert parser.parse_args([]) == ({"format": None}, [])
+        assert config["format_item"].as_str() == "$foo"
+
+        assert parser.parse_args(["-f", "$bar"]) == ({"format": "$bar"}, [])
+        assert parser.parse_args(["--format", "$baz"]) == (
+            {"format": "$baz"},
+            [],
+        )
+
+        assert config["format_item"].as_str() == "$baz"
+        assert config["format_album"].as_str() == "$baz"
+
+    def test_format_option_with_target(self, config):
+        with pytest.raises(KeyError):
+            ui.CommonOptionsParser().add_format_option(target="thingy")
+
+        parser = ui.CommonOptionsParser()
+        parser.add_format_option(target="item")
+
+        config["format_item"].set("$item")
+        config["format_album"].set("$album")
+
+        assert parser.parse_args(["-f", "$bar"]) == ({"format": "$bar"}, [])
+
+        assert config["format_item"].as_str() == "$bar"
+        assert config["format_album"].as_str() == "$album"
+
+    def test_format_option_with_album(self, config):
+        parser = ui.CommonOptionsParser()
+        parser.add_album_option()
+        parser.add_format_option()
+
+        config["format_item"].set("$item")
+        config["format_album"].set("$album")
+
+        parser.parse_args(["-f", "$bar"])
+        assert config["format_item"].as_str() == "$bar"
+        assert config["format_album"].as_str() == "$album"
+
+        parser.parse_args(["-a", "-f", "$foo"])
+        assert config["format_item"].as_str() == "$bar"
+        assert config["format_album"].as_str() == "$foo"
+
+        parser.parse_args(["-f", "$foo2", "-a"])
+        assert config["format_album"].as_str() == "$foo2"
+
+    def test_limit_option(self):
+        parser = ui.CommonOptionsParser()
+        parser.add_limit_option()
+
+        assert parser.parse_args([]) == ({"limit": None}, [])
+        assert parser.parse_args(["-l", "1"]) == ({"limit": 1}, [])
+        assert parser.parse_args(["--limit", "2"]) == ({"limit": 2}, [])
+
+        with pytest.raises(UserError, match="must be a non-negative integer"):
+            parser.parse_args(["-l", "-1"])
+
+    def test_limit_option_with_custom_flags(self):
+        parser = ui.CommonOptionsParser()
+        parser.add_limit_option(flags=("--limit",))
+
+        assert parser.parse_args(["--limit", "1"]) == ({"limit": 1}, [])
+
+        with pytest.raises(SystemExit):
+            parser.parse_args(["-l", "1"])
+
+    def test_add_all_common_options(self):
+        parser = ui.CommonOptionsParser()
+        parser.add_all_common_options()
+        assert parser.parse_args([]) == (
+            {"album": False, "path": None, "format": None},
+            [],
+        )
+
+
+class TestEncoding:
+    """Tests for the `terminal_encoding` config option and our
+    `_in_encoding` and `_out_encoding` utility functions.
+    """
+
+    def test_out_encoding_overridden(self, config):
+        config["terminal_encoding"] = "fake_encoding"
+        assert ui._out_encoding() == "fake_encoding"
+
+    def test_in_encoding_overridden(self, config):
+        config["terminal_encoding"] = "fake_encoding"
+        assert ui._in_encoding() == "fake_encoding"
+
+    def test_out_encoding_default_utf8(self, config):
+        config["terminal_encoding"] = None
+        with patch("sys.stdout") as stdout:
+            stdout.encoding = None
+            assert ui._out_encoding() == "utf-8"
+
+    def test_in_encoding_default_utf8(self, config):
+        config["terminal_encoding"] = None
+        with patch("sys.stdin") as stdin:
+            stdin.encoding = None
+            assert ui._in_encoding() == "utf-8"

@@ -1,38 +1,35 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Philippe Mongeau.
-# Copyright 2021, Graham R. Cobb.
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and ascociated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
 #
 # This module is adapted from Fuzzy in accordance to the licence of
 # that module
 
 """Provides a bare-ASCII matching query."""
 
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, Protocol
+
+from unidecode import unidecode
 
 from beets import ui
-from beets.ui import print_, decargs
-from beets.plugins import BeetsPlugin
 from beets.dbcore.query import StringFieldQuery
-from unidecode import unidecode
-import six
+from beets.plugins import BeetsPlugin
+from beets.ui import print_
+
+if TYPE_CHECKING:
+    from beets.dbcore.query import FieldQuery
+    from beets.library import Library
 
 
-class BareascQuery(StringFieldQuery):
+class BareascCLIOpts(Protocol):
+    album: bool
+    limit: int | None
+
+
+class BareascQuery(StringFieldQuery[str]):
     """Compare items using bare ASCII, without accents etc."""
+
     @classmethod
-    def string_match(cls, pattern, val):
+    def string_match(cls, pattern: str, val: str) -> bool:
         """Convert both pattern and string to plain ASCII before matching.
 
         If pattern is all lower case, also convert string to lower case so
@@ -45,41 +42,53 @@ class BareascQuery(StringFieldQuery):
         val = unidecode(val)
         return pattern in val
 
+    def col_clause(self) -> tuple[str, list[str]]:
+        """Compare ascii version of the pattern."""
+        clause = f"unidecode({self.field})"
+        if self.pattern.islower():
+            clause = f"lower({clause})"
+
+        return rf"{clause} LIKE ? ESCAPE '\'", [f"%{unidecode(self.pattern)}%"]
+
 
 class BareascPlugin(BeetsPlugin):
     """Plugin to provide bare-ASCII option for beets matching."""
-    def __init__(self):
-        """Default prefix for selecting bare-ASCII matching is #."""
-        super(BareascPlugin, self).__init__()
-        self.config.add({
-            'prefix': '#',
-        })
 
-    def queries(self):
+    def __init__(self) -> None:
+        """Default prefix for selecting bare-ASCII matching is #."""
+        super().__init__()
+        self.config.add({"prefix": "#"})
+
+    def queries(self) -> dict[str, type[FieldQuery[Any]]]:
         """Register bare-ASCII matching."""
-        prefix = self.config['prefix'].as_str()
+        prefix = self.config["prefix"].as_str()
         return {prefix: BareascQuery}
 
-    def commands(self):
+    def commands(self) -> list[ui.Subcommand]:
         """Add bareasc command as unidecode version of 'list'."""
-        cmd = ui.Subcommand('bareasc',
-                            help='unidecode version of beet list command')
-        cmd.parser.usage += u"\n" \
-            u'Example: %prog -f \'$album: $title\' artist:beatles'
+        cmd = ui.Subcommand(
+            "bareasc", help="unidecode version of beet list command"
+        )
+        cmd.parser.set_usage(
+            cmd.parser.get_usage().rstrip()
+            + "\nExample: %prog -f '$album: $title' artist:beatles"
+        )
         cmd.parser.add_all_common_options()
+        cmd.parser.add_limit_option()
         cmd.func = self.unidecode_list
         return [cmd]
 
-    def unidecode_list(self, lib, opts, args):
+    def unidecode_list(
+        self, lib: Library, opts: BareascCLIOpts, args: list[str]
+    ) -> None:
         """Emulate normal 'list' command but with unidecode output."""
-        query = decargs(args)
         album = opts.album
         # Copied from commands.py - list_items
         if album:
-            for album in lib.albums(query):
-                bare = unidecode(six.ensure_text(str(album)))
-                print_(six.ensure_text(bare))
+            for album_obj in lib.albums(args, limit=opts.limit):
+                bare = unidecode(str(album_obj))
+                print_(bare)
         else:
-            for item in lib.items(query):
-                bare = unidecode(six.ensure_text(str(item)))
-                print_(six.ensure_text(bare))
+            for item in lib.items(args, limit=opts.limit):
+                bare = unidecode(str(item))
+                print_(bare)

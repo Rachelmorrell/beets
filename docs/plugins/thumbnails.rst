@@ -1,19 +1,24 @@
 Thumbnails Plugin
-==================
+=================
 
 The ``thumbnails`` plugin creates thumbnails for your album folders with the
 album cover. This works on freedesktop.org-compliant file managers such as
 Nautilus or Thunar, and is therefore POSIX-only.
 
-To use the ``thumbnails`` plugin, enable it (see :doc:`/plugins/index`) as well
-as the :doc:`/plugins/fetchart`.  You'll need 2 additional python packages:
-:pypi:`pyxdg` and :pypi:`pathlib`.
+To use the ``thumbnails`` plugin, enable ``thumbnails`` and
+:doc:`/plugins/fetchart` in your configuration (see :ref:`using-plugins`) and
+install ``beets`` with ``thumbnails`` and ``fetchart`` extras
 
-``thumbnails`` needs to resize the covers, and therefore requires either
-`ImageMagick`_ or `Pillow`_.
+.. code-block:: bash
 
-.. _Pillow: https://github.com/python-pillow/Pillow
-.. _ImageMagick: https://www.imagemagick.org/
+    pip install "beets[fetchart,thumbnails]"
+
+``thumbnails`` need to resize the covers, and therefore requires either
+ImageMagick_ or Pillow_.
+
+.. _imagemagick: https://imagemagick.org/
+
+.. _pillow: https://github.com/python-pillow/Pillow
 
 Configuration
 -------------
@@ -24,15 +29,14 @@ file. The available options are
 - **auto**: Whether the thumbnail should be automatically set on import.
   Default: ``yes``.
 - **force**: Generate the thumbnail even when there's one that seems fine (more
-  recent than the cover art).
-  Default: ``no``.
+  recent than the cover art). Default: ``no``.
 - **dolphin**: Generate dolphin-compatible thumbnails. Dolphin (KDE file
   explorer) does not respect freedesktop.org's standard on thumbnails. This
-  functionality replaces the :doc:`/plugins/freedesktop`
-  Default: ``no``
+  functionality replaces the :doc:`/plugins/freedesktop` Default: ``no``
 
 Usage
 -----
 
 The ``thumbnails`` command provided by this plugin creates a thumbnail for
-albums that match a query (see :doc:`/reference/query`).
+albums that match a query (see :doc:`/reference/query`). Use ``-l``/``--limit``
+to cap the matched albums before creating thumbnails.

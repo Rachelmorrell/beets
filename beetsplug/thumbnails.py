@@ -1,221 +1,209 @@
-# -*- coding: utf-8 -*-
-# This file is part of beets.
-# Copyright 2016, Bruno Cauet
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the
-# "Software"), to deal in the Software without restriction, including
-# without limitation the rights to use, copy, modify, merge, publish,
-# distribute, sublicense, and/or sell copies of the Software, and to
-# permit persons to whom the Software is furnished to do so, subject to
-# the following conditions:
-#
-# The above copyright notice and this permission notice shall be
-# included in all copies or substantial portions of the Software.
-
 """Create freedesktop.org-compliant thumbnails for album folders
 
 This plugin is POSIX-only.
 Spec: standards.freedesktop.org/thumbnail-spec/latest/index.html
 """
 
-from __future__ import division, absolute_import, print_function
+from __future__ import annotations
 
-from hashlib import md5
-import os
-import shutil
-from itertools import chain
-from pathlib import PurePosixPath
 import ctypes
 import ctypes.util
+import os
+import shutil
+from hashlib import md5
+from pathlib import PurePosixPath
+from typing import TYPE_CHECKING, Any
 
-from xdg import BaseDirectory
+import platformdirs
 
 from beets.plugins import BeetsPlugin
-from beets.ui import Subcommand, decargs
-from beets import util
-from beets.util.artresizer import ArtResizer, get_im_version, get_pil_version
-import six
+from beets.ui import Subcommand
+from beets.util.artresizer import ArtResizer
+
+if TYPE_CHECKING:
+    import optparse
+    from pathlib import Path
+
+    from beets.library import Album, Library
+    from beets.util import StrPath
 
 
-BASE_DIR = os.path.join(BaseDirectory.xdg_cache_home, "thumbnails")
-NORMAL_DIR = util.bytestring_path(os.path.join(BASE_DIR, "normal"))
-LARGE_DIR = util.bytestring_path(os.path.join(BASE_DIR, "large"))
+BASE_DIR = platformdirs.user_cache_path() / "thumbnails"
+NORMAL_DIR = BASE_DIR / "normal"
+LARGE_DIR = BASE_DIR / "large"
 
 
 class ThumbnailsPlugin(BeetsPlugin):
-    def __init__(self):
-        super(ThumbnailsPlugin, self).__init__()
-        self.config.add({
-            'auto': True,
-            'force': False,
-            'dolphin': False,
-        })
+    def __init__(self) -> None:
+        super().__init__()
+        self.config.add({"auto": True, "force": False, "dolphin": False})
 
-        self.write_metadata = None
-        if self.config['auto'] and self._check_local_ok():
-            self.register_listener('art_set', self.process_album)
+        if self.config["auto"] and self._check_local_ok():
+            self.register_listener("art_set", self.process_album)
 
-    def commands(self):
-        thumbnails_command = Subcommand("thumbnails",
-                                        help=u"Create album thumbnails")
+    def commands(self) -> list[Subcommand]:
+        thumbnails_command = Subcommand(
+            "thumbnails", help="Create album thumbnails"
+        )
         thumbnails_command.parser.add_option(
-            u'-f', u'--force',
-            dest='force', action='store_true', default=False,
-            help=u'force regeneration of thumbnails deemed fine (existing & '
-                 u'recent enough)')
+            "-f",
+            "--force",
+            dest="force",
+            action="store_true",
+            default=False,
+            help="force regeneration of thumbnails deemed fine (existing & "
+            "recent enough)",
+        )
         thumbnails_command.parser.add_option(
-            u'--dolphin', dest='dolphin', action='store_true', default=False,
-            help=u"create Dolphin-compatible thumbnail information (for KDE)")
+            "--dolphin",
+            dest="dolphin",
+            action="store_true",
+            default=False,
+            help="create Dolphin-compatible thumbnail information (for KDE)",
+        )
+        thumbnails_command.parser.add_limit_option()
         thumbnails_command.func = self.process_query
 
         return [thumbnails_command]
 
-    def process_query(self, lib, opts, args):
+    def process_query(
+        self, lib: Library, opts: optparse.Values, args: list[str]
+    ) -> None:
         self.config.set_args(opts)
         if self._check_local_ok():
-            for album in lib.albums(decargs(args)):
+            for album in lib.albums(args, limit=opts.limit):
                 self.process_album(album)
 
-    def _check_local_ok(self):
-        """Check that's everythings ready:
-            - local capability to resize images
-            - thumbnail dirs exist (create them if needed)
-            - detect whether we'll use PIL or IM
-            - detect whether we'll use GIO or Python to get URIs
+    def _check_local_ok(self) -> bool:
+        """Check that everything is ready:
+        - local capability to resize images
+        - thumbnail dirs exist (create them if needed)
+        - detect whether we'll use PIL or IM
+        - detect whether we'll use GIO or Python to get URIs
         """
         if not ArtResizer.shared.local:
-            self._log.warning(u"No local image resizing capabilities, "
-                              u"cannot generate thumbnails")
+            self._log.warning(
+                "No local image resizing capabilities, "
+                "cannot generate thumbnails"
+            )
             return False
 
-        for dir in (NORMAL_DIR, LARGE_DIR):
-            if not os.path.exists(dir):
-                os.makedirs(dir)
+        for dir_ in (NORMAL_DIR, LARGE_DIR):
+            dir_.mkdir(parents=True, exist_ok=True)
 
-        if get_im_version():
-            self.write_metadata = write_metadata_im
-            tool = "IM"
-        else:
-            assert get_pil_version()  # since we're local
-            self.write_metadata = write_metadata_pil
-            tool = "PIL"
-        self._log.debug(u"using {0} to write metadata", tool)
+        if not ArtResizer.shared.can_write_metadata:
+            raise RuntimeError(
+                f"Thumbnails: ArtResizer backend {ArtResizer.shared.method}"
+                f" unexpectedly cannot write image metadata."
+            )
+        self._log.debug("using {.shared.method} to write metadata", ArtResizer)
 
-        uri_getter = GioURI()
+        uri_getter: URIGetter = GioURI()
         if not uri_getter.available:
             uri_getter = PathlibURI()
-        self._log.debug(u"using {0.name} to compute URIs", uri_getter)
+        self._log.debug("using {.name} to compute URIs", uri_getter)
         self.get_uri = uri_getter.uri
 
         return True
 
-    def process_album(self, album):
-        """Produce thumbnails for the album folder.
-        """
-        self._log.debug(u'generating thumbnail for {0}', album)
-        if not album.artpath:
-            self._log.info(u'album {0} has no art', album)
+    def process_album(self, album: Album) -> None:
+        """Produce thumbnails for the album folder."""
+        self._log.debug("generating thumbnail for {}", album)
+
+        artpath = album.art_filepath
+        if not artpath:
+            self._log.warning("album {} has no art", album)
             return
 
-        if self.config['dolphin']:
-            self.make_dolphin_cover_thumbnail(album)
+        if self.config["dolphin"]:
+            self.make_dolphin_cover_thumbnail(album.filepath, artpath)
 
-        size = ArtResizer.shared.get_size(album.artpath)
+        size = ArtResizer.shared.get_size(artpath)
         if not size:
-            self._log.warning(u'problem getting the picture size for {0}',
-                              album.artpath)
+            self._log.warning(
+                "problem getting the picture size for {.artpath}", album
+            )
             return
 
         wrote = True
         if max(size) >= 256:
-            wrote &= self.make_cover_thumbnail(album, 256, LARGE_DIR)
-        wrote &= self.make_cover_thumbnail(album, 128, NORMAL_DIR)
+            wrote &= self.make_cover_thumbnail(album, artpath, 256, LARGE_DIR)
+        wrote &= self.make_cover_thumbnail(album, artpath, 128, NORMAL_DIR)
 
         if wrote:
-            self._log.info(u'wrote thumbnail for {0}', album)
+            self._log.info("wrote thumbnail for {}", album)
         else:
-            self._log.info(u'nothing to do for {0}', album)
+            self._log.info("nothing to do for {}", album)
 
-    def make_cover_thumbnail(self, album, size, target_dir):
+    def make_cover_thumbnail(
+        self, album: Album, artpath: Path, size: int, target_dir: Path
+    ) -> bool:
         """Make a thumbnail of given size for `album` and put it in
         `target_dir`.
         """
-        target = os.path.join(target_dir, self.thumbnail_file_name(album.path))
+        target = target_dir / self.thumbnail_file_name(album.filepath)
 
-        if os.path.exists(target) and \
-           os.stat(target).st_mtime > os.stat(album.artpath).st_mtime:
-            if self.config['force']:
-                self._log.debug(u"found a suitable {1}x{1} thumbnail for {0}, "
-                                u"forcing regeneration", album, size)
+        if target.exists() and target.stat().st_mtime > artpath.stat().st_mtime:
+            if self.config["force"]:
+                self._log.debug(
+                    "found a suitable {0}x{0} thumbnail for {1}, "
+                    "forcing regeneration",
+                    size,
+                    album,
+                )
             else:
-                self._log.debug(u"{1}x{1} thumbnail for {0} exists and is "
-                                u"recent enough", album, size)
+                self._log.debug(
+                    "{0}x{0} thumbnail for {1} exists and is recent enough",
+                    size,
+                    album,
+                )
                 return False
-        resized = ArtResizer.shared.resize(size, album.artpath,
-                                           util.syspath(target))
-        self.add_tags(album, util.syspath(resized))
+        resized = ArtResizer.shared.resize(size, artpath, target)
+        self.add_tags(artpath, resized)
         shutil.move(resized, target)
         return True
 
-    def thumbnail_file_name(self, path):
+    def thumbnail_file_name(self, path: Path) -> str:
         """Compute the thumbnail file name
         See https://standards.freedesktop.org/thumbnail-spec/latest/x227.html
         """
         uri = self.get_uri(path)
-        hash = md5(uri.encode('utf-8')).hexdigest()
-        return util.bytestring_path("{0}.png".format(hash))
+        hash_ = md5(uri.encode("utf-8")).hexdigest()
+        return f"{hash_}.png"
 
-    def add_tags(self, album, image_path):
+    def add_tags(self, artpath: Path, image_path: Path) -> None:
         """Write required metadata to the thumbnail
         See https://standards.freedesktop.org/thumbnail-spec/latest/x142.html
         """
-        mtime = os.stat(album.artpath).st_mtime
-        metadata = {"Thumb::URI": self.get_uri(album.artpath),
-                    "Thumb::MTime": six.text_type(mtime)}
+        mtime = artpath.stat().st_mtime
+        metadata = {
+            "Thumb::URI": self.get_uri(artpath),
+            "Thumb::MTime": str(mtime),
+        }
         try:
-            self.write_metadata(image_path, metadata)
+            ArtResizer.shared.write_metadata(image_path, metadata)
         except Exception:
-            self._log.exception(u"could not write metadata to {0}",
-                                util.displayable_path(image_path))
+            self._log.exception("could not write metadata to {}", image_path)
 
-    def make_dolphin_cover_thumbnail(self, album):
-        outfilename = os.path.join(album.path, b".directory")
-        if os.path.exists(outfilename):
+    def make_dolphin_cover_thumbnail(
+        self, album_path: Path, artpath: Path
+    ) -> None:
+        outfilename = album_path / ".directory"
+        if outfilename.exists():
             return
-        artfile = os.path.split(album.artpath)[1]
-        with open(outfilename, 'w') as f:
-            f.write('[Desktop Entry]\n')
-            f.write('Icon=./{0}'.format(artfile.decode('utf-8')))
+        artfile = artpath.name
+        with outfilename.open("w") as f:
+            f.write("[Desktop Entry]\n")
+            f.write(f"Icon=./{artfile}")
             f.close()
-        self._log.debug(u"Wrote file {0}", util.displayable_path(outfilename))
+        self._log.debug("Wrote file {}", outfilename)
 
 
-def write_metadata_im(file, metadata):
-    """Enrich the file metadata with `metadata` dict thanks to IM."""
-    command = ['convert', file] + \
-        list(chain.from_iterable(('-set', k, v)
-                                 for k, v in metadata.items())) + [file]
-    util.command_output(command)
-    return True
-
-
-def write_metadata_pil(file, metadata):
-    """Enrich the file metadata with `metadata` dict thanks to PIL."""
-    from PIL import Image, PngImagePlugin
-    im = Image.open(file)
-    meta = PngImagePlugin.PngInfo()
-    for k, v in metadata.items():
-        meta.add_text(k, v, 0)
-    im.save(file, "PNG", pnginfo=meta)
-    return True
-
-
-class URIGetter(object):
+class URIGetter:
     available = False
     name = "Abstract base"
 
-    def uri(self, path):
+    def uri(self, path: StrPath) -> str:
         raise NotImplementedError()
 
 
@@ -223,33 +211,32 @@ class PathlibURI(URIGetter):
     available = True
     name = "Python Pathlib"
 
-    def uri(self, path):
-        return PurePosixPath(util.py3_path(path)).as_uri()
+    def uri(self, path: StrPath) -> str:
+        return PurePosixPath(path).as_uri()
 
 
-def copy_c_string(c_string):
+def copy_c_string(c_string: Any) -> bytes | None:
     """Copy a `ctypes.POINTER(ctypes.c_char)` value into a new Python
     string and return it. The old memory is then safe to free.
     """
     # This is a pretty dumb way to get a string copy, but it seems to
     # work. A more surefire way would be to allocate a ctypes buffer and copy
     # the data with `memcpy` or somesuch.
-    s = ctypes.cast(c_string, ctypes.c_char_p).value
-    return b'' + s
+    return ctypes.cast(c_string, ctypes.c_char_p).value
 
 
 class GioURI(URIGetter):
-    """Use gio URI function g_file_get_uri. Paths must be utf-8 encoded.
-    """
+    """Use gio URI function g_file_get_uri. Paths must be utf-8 encoded."""
+
     name = "GIO"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.libgio = self.get_library()
         self.available = bool(self.libgio)
-        if self.available:
+        if self.libgio:
             self.libgio.g_type_init()  # for glib < 2.36
 
-            self.libgio.g_file_get_uri.argtypes = [ctypes.c_char_p]
+            self.libgio.g_file_new_for_path.argtypes = [ctypes.c_char_p]
             self.libgio.g_file_new_for_path.restype = ctypes.c_void_p
 
             self.libgio.g_file_get_uri.argtypes = [ctypes.c_void_p]
@@ -257,38 +244,43 @@ class GioURI(URIGetter):
 
             self.libgio.g_object_unref.argtypes = [ctypes.c_void_p]
 
-    def get_library(self):
+    def get_library(self) -> ctypes.CDLL | None:
         lib_name = ctypes.util.find_library("gio-2")
         try:
             if not lib_name:
-                return False
+                return None
             return ctypes.cdll.LoadLibrary(lib_name)
         except OSError:
-            return False
+            return None
 
-    def uri(self, path):
-        g_file_ptr = self.libgio.g_file_new_for_path(path)
+    def uri(self, path: StrPath) -> str:
+        libgio = self.libgio
+        if libgio is None:
+            raise RuntimeError("GIO library is unavailable")
+
+        g_file_ptr = libgio.g_file_new_for_path(os.fsencode(path))
         if not g_file_ptr:
-            raise RuntimeError(u"No gfile pointer received for {0}".format(
-                util.displayable_path(path)))
+            raise RuntimeError(f"No gfile pointer received for {path}")
 
         try:
-            uri_ptr = self.libgio.g_file_get_uri(g_file_ptr)
+            uri_ptr = libgio.g_file_get_uri(g_file_ptr)
         finally:
-            self.libgio.g_object_unref(g_file_ptr)
+            libgio.g_object_unref(g_file_ptr)
         if not uri_ptr:
-            self.libgio.g_free(uri_ptr)
-            raise RuntimeError(u"No URI received from the gfile pointer for "
-                               u"{0}".format(util.displayable_path(path)))
+            libgio.g_free(uri_ptr)
+            raise RuntimeError(
+                f"No URI received from the gfile pointer for {path}"
+            )
 
         try:
             uri = copy_c_string(uri_ptr)
         finally:
-            self.libgio.g_free(uri_ptr)
+            libgio.g_free(uri_ptr)
+
+        if uri is None:
+            raise RuntimeError("GIO returned NULL for filename")
 
         try:
-            return uri.decode(util._fsencoding())
+            return os.fsdecode(uri)
         except UnicodeDecodeError:
-            raise RuntimeError(
-                "Could not decode filename from GIO: {!r}".format(uri)
-            )
+            raise RuntimeError(f"Could not decode filename from GIO: {uri!r}")

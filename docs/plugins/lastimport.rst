@@ -1,46 +1,52 @@
 LastImport Plugin
 =================
 
-The ``lastimport`` plugin downloads play-count data from your `Last.fm`_
-library into beets' database. You can later create :doc:`smart playlists
-</plugins/smartplaylist>` by querying ``play_count`` and do other fun stuff
-with this field.
+The ``lastimport`` plugin downloads play-count data from your Last.fm_ library
+into beets' database. You can later create :doc:`smart playlists
+</plugins/smartplaylist>` by querying ``lastfm_play_count`` and do other fun
+stuff with this field.
 
-.. _Last.fm: https://last.fm
+.. _last.fm: https://www.last.fm/
 
 Installation
 ------------
 
-The plugin requires `pylast`_, which you can install using `pip`_ by typing::
+To use the ``lastimport`` plugin, first enable it in your configuration (see
+:ref:`using-plugins`). Then, install ``beets`` with ``lastimport`` extra
 
-    pip install pylast
+.. code-block:: bash
 
-After you have pylast installed, enable the ``lastimport`` plugin in your
-configuration (see :ref:`using-plugins`).
+    pip install "beets[lastimport]"
 
-Next, add your Last.fm username to your beets configuration file::
+Next, add your Last.fm username to your beets configuration file:
+
+::
 
     lastfm:
         user: beetsfanatic
-
-.. _pip: https://pip.pypa.io
-.. _pylast: https://github.com/pylast/pylast
 
 Importing Play Counts
 ---------------------
 
 Simply run ``beet lastimport`` and wait for the plugin to request tracks from
-Last.fm and match them to your beets library. (You will be notified of tracks
-in your Last.fm profile that do not match any songs in your library.)
+Last.fm and match them to your beets library. (You will be notified of tracks in
+your Last.fm profile that do not match any songs in your library.)
 
-Then, your matched tracks will be populated with the ``play_count`` field,
-which you can use in any query or template. For example::
+Then, your matched tracks will be populated with the ``lastfm_play_count``
+field, which you can use in any query or template. For example:
 
-    $ beet ls -f '$title: $play_count' play_count:5..
+::
+
+    $ beet ls -f '$title: $lastfm_play_count' lastfm_play_count:5..
     Eple (Melody A.M.): 60
 
 To see more information (namely, the specific play counts for matched tracks),
 use the ``-v`` option.
+
+.. versionchanged:: 2.8.0
+
+    The ``play_count`` field was renamed to ``lastfm_play_count`` to avoid
+    confusion with ``play_count`` field populated by :doc:`mpdstats` plugin.
 
 Configuration
 -------------
@@ -48,14 +54,15 @@ Configuration
 Aside from the required ``lastfm.user`` field, this plugin has some specific
 options under the ``lastimport:`` section:
 
-* **per_page**: The number of tracks to request from the API at once.
-  Default: 500.
-* **retry_limit**: How many times should we re-send requests to Last.fm on
-  failure?
-  Default: 3.
+- **per_page**: The number of tracks to request from the API at once. Default:
+  500.
+- **retry_limit**: How many times should we re-send requests to Last.fm on
+  failure? Default: 3.
 
 By default, the plugin will use beets's own Last.fm API key. You can also
-override it with your own API key::
+override it with your own API key:
+
+::
 
     lastfm:
         api_key: your_api_key
